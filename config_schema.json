@@ -12,36 +12,47 @@
       "type": "array",
       "items": { "type": "string" },
       "default": ["PHI"],
-      "description": "ESPN team abbreviations to track, e.g. PHI, NYY, DET"
+      "description": "ESPN team abbreviations, used as the fallback game (scheduled/recent) when nothing is live, and as the rotation filter if show_favorite_teams_only is true"
+    },
+    "show_favorite_teams_only": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, only cycle through favorite teams' live games. If false (default), cycle through every currently live MLB game leaguewide"
+    },
+    "game_rotation_seconds": {
+      "type": "integer",
+      "default": 8,
+      "minimum": 3,
+      "description": "How many seconds to show each live game before switching to the next one"
     },
     "update_interval_seconds": {
       "type": "integer",
       "default": 300,
       "minimum": 30,
-      "description": "How often to poll ESPN when no game is live"
+      "description": "How often to poll ESPN when nothing is live"
     },
     "live_update_interval_seconds": {
       "type": "integer",
       "default": 15,
       "minimum": 5,
-      "description": "How often to poll ESPN while a favorite team's game is live"
+      "description": "How often to poll ESPN while games are live"
     },
     "display_duration": {
       "type": "number",
       "default": 20,
-      "description": "Seconds to show this plugin per rotation"
+      "description": "Seconds to show this plugin per rotation in the main LEDMatrix display cycle"
     },
     "away_color": {
       "type": "array",
       "items": { "type": "integer" },
       "default": [0, 142, 226],
-      "description": "RGB fallback color for the away team block (top-left)"
+      "description": "RGB fallback color for the away team column"
     },
     "home_color": {
       "type": "array",
       "items": { "type": "integer" },
       "default": [200, 16, 46],
-      "description": "RGB fallback color for the home team block (bottom-left)"
+      "description": "RGB fallback color for the home team column"
     },
     "use_team_colors": {
       "type": "boolean",
@@ -51,12 +62,36 @@
     "show_logos": {
       "type": "boolean",
       "default": true,
-      "description": "Show each team's logo at the far left of its color block"
+      "description": "Show each team's logo at the top of its column"
     },
     "logo_dir": {
       "type": "string",
       "default": "assets/sports/mlb_logos",
       "description": "Path (relative to the LEDMatrix install root) to bundled team logo PNGs, named e.g. PHI.png. Falls back to downloading from ESPN if a team's file isn't found here."
+    },
+    "base_fill_color": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "default": [255, 255, 255],
+      "description": "RGB color for an occupied base on the diamond indicator"
+    },
+    "base_empty_color": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "default": [95, 95, 95],
+      "description": "RGB color for an empty base outline on the diamond indicator"
+    },
+    "out_fill_color": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "default": [255, 140, 0],
+      "description": "RGB color for a recorded out square"
+    },
+    "out_empty_color": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "default": [120, 120, 120],
+      "description": "RGB color for a not-yet-recorded out square outline"
     },
     "test_mode": {
       "type": "boolean",
