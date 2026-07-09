@@ -108,13 +108,30 @@ class TidbytBaseballPlugin(BasePlugin):
         self._fit_font_cache: Dict[Tuple[str, int, bool], ImageFont.FreeTypeFont] = {}
 
         self._repo_font_path = self._discover_repo_font()
+
+        # Verify the bundled font up front, not just when a render call
+        # happens to fail into the fallback -- this makes it immediately
+        # visible in the logs whether the plugin's own fonts/ folder
+        # actually made it into the install correctly.
+        expected_bundled_path = FONT_CHOICES.get(self.font_choice)
+        if expected_bundled_path and os.path.isfile(expected_bundled_path):
+            self.logger.info(f"font_choice '{self.font_choice}' -> bundled file found OK at {expected_bundled_path}")
+        elif self.font_choice != "system":
+            self.logger.error(
+                f"font_choice '{self.font_choice}' -> bundled file NOT FOUND at "
+                f"{expected_bundled_path}. This means the plugin's fonts/ folder "
+                f"didn't make it into your install correctly (check that "
+                f"{os.path.join(PLUGIN_DIR, 'fonts')} actually contains the .ttf files). "
+                f"Text will fall back to auto-discovery or, worst case, PIL's crude "
+                f"default bitmap font -- which is almost certainly why things look wrong."
+            )
+
         if self._repo_font_path:
-            self.logger.info(f"Using bundled font: {self._repo_font_path}")
-        else:
-            self.logger.info("No assets/fonts directory found; using system fonts as fallback.")
+            self.logger.info(f"Also found a font in the main LEDMatrix install: {self._repo_font_path}")
 
         self.font_small = self._load_font(9)
         self.font_tiny = self._load_font(7)
+        self.font_count = self._load_font(6)
 
     # ------------------------------------------------------------------
     # Config handling
@@ -152,6 +169,7 @@ class TidbytBaseballPlugin(BasePlugin):
             self._fit_font_cache.clear()
             self.font_small = self._load_font(9)
             self.font_tiny = self._load_font(7)
+            self.font_count = self._load_font(6)
 
     def validate_config(self) -> bool:
         if not self.favorite_teams:
@@ -197,7 +215,7 @@ class TidbytBaseballPlugin(BasePlugin):
         elif self.font_choice != "system":
             self.logger.warning(
                 f"font_choice '{self.font_choice}' bundled file not found at "
-                f"expected path; falling back to auto-discovery / system font."
+                f"expected path ({bundled_path}); falling back to auto-discovery / system font."
             )
 
         if self._repo_font_path:
@@ -219,6 +237,20 @@ class TidbytBaseballPlugin(BasePlugin):
             except Exception:
                 continue
         if font is None:
+            # IMPORTANT: PIL's load_default() renders a fixed, crude
+            # bitmap font that IGNORES the requested `size` entirely on
+            # a lot of Pillow versions. If you're seeing blocky,
+            # oddly-large, or generic-looking text regardless of the
+            # font_choice you picked, THIS is almost certainly why --
+            # every candidate above failed to load. Check the plugin
+            # logs for this exact error to confirm.
+            self.logger.error(
+                f"ALL font candidates failed to load for size={size}, bold={bold}: "
+                f"{candidates}. Falling back to PIL's built-in default bitmap font, "
+                f"which ignores the requested size -- this is very likely why text "
+                f"looks wrong. Check that the plugin's fonts/ folder actually made it "
+                f"into your install (should be at {os.path.join(PLUGIN_DIR, 'fonts')})."
+            )
             font = ImageFont.load_default()
 
         self._font_cache[cache_key] = font
@@ -566,12 +598,14 @@ class TidbytBaseballPlugin(BasePlugin):
         right_x0 = left_w + 2
         right_w = width - right_x0 - 1
 
-        self._draw_inning(image, right_x0 + 1, 1, game)
-        self._draw_outs(draw, right_x0, 1, right_w, game)
+        top_margin = 2  # keeps inning triangle/number and outs off the physical top edge
+        self._draw_inning(image, right_x0 + 1, top_margin, game)
+        self._draw_outs(draw, right_x0, top_margin, right_w, game)
 
-        top_row_bottom = 7  # matches the now-smaller inning triangle's actual extent
+        inning_tri_size = 6
+        top_row_bottom = top_margin + inning_tri_size
         lower_y = height - 6  # bottom-row text measures ~5px tall, so this is measured, not padded
-        diamond_y = top_row_bottom  # shifted up 1px from before to make room for a bigger diamond
+        diamond_y = top_row_bottom
         diamond_available_h = (lower_y - 2) - diamond_y  # leave a clear gap before the bottom row
         diamond_w = int(right_w * 0.5)
         diamond_x = right_x0 + (right_w - diamond_w) // 2
@@ -581,7 +615,7 @@ class TidbytBaseballPlugin(BasePlugin):
         self._draw_count(draw, right_x0 + 1, lower_y, game)
 
         if self.show_batter_name:
-            count_bbox = draw.textbbox((0, 0), count_text, font=self.font_tiny)
+            count_bbox = draw.textbbox((0, 0), count_text, font=self.font_count)
             count_w = count_bbox[2] - count_bbox[0]
             batter_x = right_x0 + 1 + count_w + 4
             batter_max_w = (right_x0 + right_w) - batter_x
@@ -637,8 +671,14 @@ class TidbytBaseballPlugin(BasePlugin):
         return f"{parts[0][0]}. {' '.join(parts[1:])}"
 
     def _draw_bold_text(self, draw, xy, text, font, fill):
+        """Horizontal-only faux-bold. The original version also offset
+        vertically (0,1), which at these very small pixel heights (5-7px
+        tall glyphs) smears strokes into the row above/below and hurts
+        legibility more than it helps -- that's the likely cause of the
+        'fonts not readable' feedback. Horizontal-only still adds some
+        weight without that vertical smearing."""
         x, y = xy
-        for dx, dy in ((0, 0), (1, 0), (0, 1)):
+        for dx, dy in ((0, 0), (1, 0)):
             draw.text((x + dx, y + dy), text, font=font, fill=fill)
 
     # ---- anti-aliasing helper -----------------------------------------
@@ -737,27 +777,34 @@ class TidbytBaseballPlugin(BasePlugin):
                 self._draw_smooth_polygon(image, pts, outline=self.base_empty_color, width=1)
 
     def _draw_inning(self, image, x, y, game):
-        """Anti-aliased solid triangle -- point up for top of inning,
-        point down for bottom -- plus the inning number, vertically
-        centered on the triangle using its actual measured glyph height
-        rather than a guessed offset."""
+        """Solid triangle -- point up for top of inning, point down for
+        bottom -- plus the inning number, vertically centered on the
+        triangle using its actual measured glyph height.
+
+        Drawn with a HARD edge (no anti-aliasing) rather than through
+        _draw_smooth_polygon: at only 6px tall, supersampling +
+        downsampling was producing a soft/blobby shape that read as
+        "not really a triangle" rather than a clean one. The diamond
+        (bigger, benefits more from smoothing) still uses the
+        anti-aliased path -- this is a case where AA hurts rather than
+        helps because the shape is too small for it."""
         tri_size = 6
+        draw = ImageDraw.Draw(image)
         if game["inning_half"]:
             pts = [(x, y + tri_size), (x + tri_size / 2, y), (x + tri_size, y + tri_size)]
         else:
             pts = [(x, y), (x + tri_size, y), (x + tri_size / 2, y + tri_size)]
-        self._draw_smooth_polygon(image, pts, fill=(255, 255, 255))
+        draw.polygon(pts, fill=(255, 255, 255))
 
-        draw = ImageDraw.Draw(image)
         number_text = str(game["inning"])
         bbox = draw.textbbox((0, 0), number_text, font=self.font_tiny)
         glyph_h = bbox[3] - bbox[1]
         text_y = y + (tri_size - glyph_h) // 2 - bbox[1]
-        draw.text((x + tri_size + 2, text_y), number_text, font=self.font_tiny, fill=(255, 255, 255))
+        draw.text((x + tri_size + 3, text_y), number_text, font=self.font_tiny, fill=(255, 255, 255))
 
     def _draw_count(self, draw, x, y, game):
         count_text = f"{game['balls']}-{game['strikes']}"
-        draw.text((x, y), count_text, font=self.font_tiny, fill=(255, 200, 0))
+        draw.text((x, y), count_text, font=self.font_count, fill=(255, 200, 0))
 
     def _draw_batter(self, draw, x, y, max_width, batter_name):
         """Draws 'F. Lastname' for whoever is currently at bat, shrunk

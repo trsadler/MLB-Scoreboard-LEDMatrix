@@ -144,6 +144,53 @@ See `config_schema.json` for the full list.
 | `show_batter_name` | `true` | Show current batter next to the count |
 | `test_mode` | `false` | Render a fake game for layout testing |
 
+## If text still looks wrong / blocky / generic on real hardware
+
+This is very likely a font loading failure, not a design problem. PIL's
+built-in fallback font (`ImageFont.load_default()`) **ignores whatever
+size you ask for** and renders a fixed, crude bitmap font -- which
+would explain blocky/unreadable text AND an oversized ball-strike count
+at the same time, since neither can actually shrink to the size the
+code is requesting.
+
+**Check your plugin logs right after this loads.** You should see:
+```
+INFO: font_choice '5by7' -> bundled file found OK at .../fonts/5by7_regular.ttf
+```
+If instead you see:
+```
+ERROR: font_choice '5by7' -> bundled file NOT FOUND at ...
+```
+that confirms the `fonts/` folder didn't make it into your installed
+copy of the plugin correctly. Most likely cause: if you used the GitHub
+web upload method rather than `git`, double check the three `.ttf`
+files actually show up in your repo's `fonts/` folder (binary files
+sometimes don't survive a drag-and-drop upload cleanly). Re-upload them
+if they're missing or 0 bytes, then reinstall/update the plugin.
+
+I verified this diagnostic actually fires correctly by testing with the
+`fonts/` folder deliberately removed -- it logs a clear, loud error
+rather than failing silently into the generic fallback.
+
+## Other fixes in this round
+
+- **Faux-bold no longer smears text**: it previously offset the text
+  both horizontally AND vertically to thicken strokes. At these very
+  small glyph heights (5-7px), the vertical offset was blurring letters
+  into the row above/below, which likely also contributed to
+  readability complaints even with the correct font loading fine.
+  Now horizontal-only.
+- **Ball-strike count uses its own smaller font** (`font_count`, size 6)
+  instead of reusing the same size as the inning number -- it was
+  rendering noticeably larger than intended.
+- **Inning triangle is no longer anti-aliased**: at only 6px, the
+  supersample+downsample smoothing was producing a soft/blobby shape
+  instead of a clean triangle -- ironically, anti-aliasing hurt more
+  than it helped at that size. It's drawn with a hard edge now (the
+  diamond, being bigger, still benefits from and keeps anti-aliasing).
+- **Inning indicator now has a proper top margin** (2px) instead of
+  sitting almost flush against the panel's physical top edge.
+
 ## Data source
 
 ESPN's public scoreboard endpoint, no API key required:
