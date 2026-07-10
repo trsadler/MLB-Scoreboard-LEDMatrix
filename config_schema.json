@@ -21,7 +21,7 @@
     "show_favorite_teams_only": {
       "type": "boolean",
       "default": false,
-      "description": "STRICT mode: never show any other team's games at all (live, past, or upcoming) -- always favorites only. When off (default), favorites still take priority whenever they have a live game, but other teams' live games and past/upcoming games can fill the rotation when no favorite is currently playing."
+      "description": "If true, only cycle through favorite teams' live games. If false (default), cycle through every currently live MLB game leaguewide"
     },
     "game_rotation_seconds": {
       "type": "integer",
@@ -52,9 +52,9 @@
         "type": "integer"
       },
       "default": [
-        255,
-        255,
-        255
+        0,
+        142,
+        226
       ],
       "description": "RGB fallback color for the away team column"
     },
@@ -64,9 +64,9 @@
         "type": "integer"
       },
       "default": [
-        255,
-        255,
-        255
+        200,
+        16,
+        46
       ],
       "description": "RGB fallback color for the home team column"
     },
@@ -138,69 +138,22 @@
       "default": false,
       "description": "Render a fake in-progress game instead of calling ESPN (for layout testing)"
     },
+    "font_choice": {
+      "type": "string",
+      "enum": [
+        "5by7",
+        "4x6",
+        "press_start_2p",
+        "tom_thumb",
+        "system"
+      ],
+      "default": "tom_thumb",
+      "description": "Pixel font for team abbreviation/score text, bundled directly with this plugin. 5by7 and 4x6 are compact TrueType pixel fonts. tom_thumb is a genuine BDF bitmap font (3x5, MIT licensed) rendered with zero anti-aliasing -- exact pixel-for-pixel, no FreeType rasterization involved. press_start_2p is wider per-character and renders very small in this column. system falls back to a generic bold monospace font."
+    },
     "show_batter_name": {
       "type": "boolean",
       "default": true,
       "description": "Show the current batter (first initial + last name) at the bottom-right of the black half, next to the ball-strike count. Depends on ESPN actually providing batter data in the scoreboard response -- silently omitted if not available."
-    },
-    "show_last_play": {
-      "type": "boolean",
-      "default": true,
-      "description": "Temporarily replace the black half with the last play description when something significant happens (hits, walks, strikeouts, outs, runs). Skips routine ball/strike/foul updates."
-    },
-    "last_play_display_seconds": {
-      "type": "number",
-      "default": 5,
-      "minimum": 1,
-      "description": "How many seconds the last-play overlay stays up before reverting to the normal layout"
-    },
-    "last_play_filter": {
-      "type": "string",
-      "enum": [
-        "significant",
-        "all"
-      ],
-      "default": "significant",
-      "description": "significant = only flash for hits/walks/strikeouts/outs/runs (skips routine ball/strike/foul updates). all = flash for every single play update including pitch-by-pitch."
-    },
-    "show_past_games": {
-      "type": "boolean",
-      "default": false,
-      "description": "Include recently completed favorite-team games in the rotation, showing the final score with the winning team highlighted in yellow and \"FINAL\" on the black half."
-    },
-    "show_upcoming_games": {
-      "type": "boolean",
-      "default": false,
-      "description": "Include upcoming scheduled favorite-team games in the rotation (in start-time order), showing \"UPCOMING\" plus the date/time on the black half. No score is shown since the game hasn't started."
-    },
-    "max_past_games": {
-      "type": "integer",
-      "default": 3,
-      "minimum": 1,
-      "description": "Maximum number of past (final) favorite-team games to include in rotation"
-    },
-    "max_upcoming_games": {
-      "type": "integer",
-      "default": 3,
-      "minimum": 1,
-      "description": "Maximum number of upcoming favorite-team games to include in rotation"
-    },
-    "past_upcoming_all_teams": {
-      "type": "boolean",
-      "default": false,
-      "description": "Only relevant when show_favorite_teams_only is off. When no favorite team is live, this controls whether past/upcoming games expand to include all teams (true) or stay scoped to favorite teams only (false, default). Ignored (always favorites-only) when show_favorite_teams_only is on."
-    },
-    "upcoming_games_lookahead_days": {
-      "type": "integer",
-      "default": 5,
-      "minimum": 1,
-      "description": "How many days ahead to explicitly check for upcoming favorite-team games. ESPN's scoreboard endpoint only returns TODAY's games by default, so this queries additional future days individually (one extra request per day) to actually find a team's next scheduled game."
-    },
-    "upcoming_games_refresh_seconds": {
-      "type": "integer",
-      "default": 1800,
-      "minimum": 60,
-      "description": "How often to re-run the future-days lookahead (separate from the main scoreboard poll interval, since schedules barely change within a day -- no need to re-check every 15 seconds during a live game)."
     }
   },
   "required": [
