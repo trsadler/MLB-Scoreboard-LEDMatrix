@@ -35,8 +35,11 @@ RGB PIL.Image internally and then tries, in order:
     2. display_manager.set_image(...)
 """
 
+import datetime
 import logging
+import math
 import os
+import random
 import re
 import threading
 import time
@@ -62,8 +65,8 @@ except ImportError:
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard"
 ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary"
 
-DEFAULT_AWAY_COLOR = (0, 142, 226)
-DEFAULT_HOME_COLOR = (200, 16, 46)
+DEFAULT_AWAY_COLOR = (255, 255, 255)
+DEFAULT_HOME_COLOR = (255, 255, 255)
 
 # Fonts bundled directly with this plugin (in ./fonts/), pulled from the
 # same assets/fonts/ folder the core LEDMatrix project ships with, so
@@ -109,6 +112,15 @@ NON_SIGNIFICANT_PLAY_TYPES = {
     "start-batterpitcher", "pitch", "no-pitch",
     "automatic-ball", "automatic-strike", "warmup",
 }
+
+# Best-effort guess at ESPN's home-run type code -- I have NOT confirmed
+# any of these against real data (unlike NON_SIGNIFICANT_PLAY_TYPES,
+# where "ball" and "start-batterpitcher" are both confirmed real
+# samples). If the special home-run animation never triggers on an
+# actual home run, check the plugin logs for the line "Last-play flash
+# QUEUED for ... (type=...)" during a real home run and add whatever
+# the actual type string is to this set.
+HOME_RUN_PLAY_TYPES = {"home-run", "homerun", "home_run", "hr", "home run"}
 
 # Preference order for auto-discovering a bundled font from the main
 # LEDMatrix install, used only when font_choice is "system" or the
@@ -228,6 +240,9 @@ class TidbytBaseballPlugin(BasePlugin):
         self.session.headers.update({"User-Agent": "LEDMatrix-TidbytBaseball/1.0"})
 
         self.live_games: List[Dict[str, Any]] = []
+        self.past_games: List[Dict[str, Any]] = []
+        self.upcoming_games: List[Dict[str, Any]] = []
+        self.rotation_games: List[Dict[str, Any]] = []  # what _current_game()/_maybe_rotate() actually cycle through
         self.fallback_game: Optional[Dict[str, Any]] = None
         self.current_index: int = 0
         self.last_switch_time: float = time.time()
@@ -237,8 +252,23 @@ class TidbytBaseballPlugin(BasePlugin):
         # entirely new dicts each poll (live_games is rebuilt from
         # scratch), so this has to live on self, not on the game dict,
         # to persist across polls.
+        #
+        # IMPORTANT: this is a QUEUE + single "active" slot, not just a
+        # per-game expiry timestamp. A plain "flash_until per event_id"
+        # design (the original version) let a significant play's flash
+        # window start counting down the moment it was DETECTED,
+        # completely independent of whether that game was actually on
+        # screen -- normal rotation runs on its own separate timer with
+        # no awareness of pending flashes. With 2+ live games rotating,
+        # a flash could easily expire before rotation ever got around to
+        # showing that game, so the person never saw it -- exactly the
+        # "works intermittently" symptom. The queue below is serviced by
+        # _service_flash_queue(), called before rotation each frame, so
+        # a pending flash can force-jump the display to the right game
+        # (pausing normal rotation) and guarantee it's actually seen.
         self._last_shown_play_id: Dict[str, str] = {}
-        self._flash_until: Dict[str, float] = {}
+        self._pending_flash_event_ids: List[str] = []
+        self._active_flash: Optional[Dict[str, Any]] = None
 
         self._logo_cache: Dict[str, Optional[Image.Image]] = {}
         self._font_cache: Dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
@@ -358,27 +388,22 @@ class TidbytBaseballPlugin(BasePlugin):
         self.base_empty_color = tuple(cfg.get("base_empty_color", [95, 95, 95]))
         self.out_fill_color = tuple(cfg.get("out_fill_color", [255, 140, 0]))
         self.out_empty_color = tuple(cfg.get("out_empty_color", [120, 120, 120]))
-        self.font_choice = cfg.get("font_choice", "tom_thumb")
+        self.font_choice = "tom_thumb"  # no longer user-configurable -- see FONT_CHOICES for fallback chain if this fails to load
         self.show_batter_name = cfg.get("show_batter_name", True)
         self.show_last_play = cfg.get("show_last_play", True)
         self.last_play_display_seconds = cfg.get("last_play_display_seconds", 5)
         self.last_play_filter = cfg.get("last_play_filter", "significant")
+        self.show_past_games = cfg.get("show_past_games", False)
+        self.show_upcoming_games = cfg.get("show_upcoming_games", False)
+        self.max_past_games = cfg.get("max_past_games", 3)
+        self.max_upcoming_games = cfg.get("max_upcoming_games", 3)
         self.test_mode = cfg.get("test_mode", False)
 
     def on_config_change(self, new_config):
         self.config = new_config
-        old_font_choice = getattr(self, "font_choice", None)
         self._derive_settings()
         with self._data_lock:
             self.last_fetch_time = 0
-        if self.font_choice != old_font_choice:
-            # Selected font changed -- clear caches so _load_font picks
-            # up the new one instead of returning a stale cached object.
-            self._font_cache.clear()
-            self._fit_font_cache.clear()
-            self.font_small = self._load_font(9)
-            self.font_tiny = self._load_font(7)
-            self.font_count = self._load_font(6)
 
     def cleanup(self):
         """Called by the core on plugin unload/disable, if it supports
@@ -698,7 +723,8 @@ class TidbytBaseballPlugin(BasePlugin):
             with self._data_lock:
                 self.live_games = [game]
                 self.fallback_game = None
-                if self.current_index >= len(self.live_games):
+                self.rotation_games = [game]
+                if self.current_index >= len(self.rotation_games):
                     self.current_index = 0
             return
 
@@ -719,9 +745,9 @@ class TidbytBaseballPlugin(BasePlugin):
         # data, tries again next interval) instead of permanently
         # freezing everything.
         try:
-            live_games, fallback_game = self._process_scoreboard(data)
+            live_games, past_games, upcoming_games, fallback_game = self._process_scoreboard(data)
 
-            for g in live_games:
+            for g in live_games + past_games + upcoming_games:
                 self._resolve_logos(g)
             if fallback_game:
                 self._resolve_logos(fallback_game)
@@ -731,7 +757,9 @@ class TidbytBaseballPlugin(BasePlugin):
             # it from ESPN's more detailed per-game summary endpoint
             # instead. Wrapped in its own try/except per game so one
             # game's summary failing (or ESPN changing that endpoint's
-            # shape) can't take down the main scoreboard update.
+            # shape) can't take down the main scoreboard update. Only
+            # live games need this -- past/upcoming games have no
+            # current pitcher to look up a pitch count for.
             for g in live_games:
                 try:
                     self._enrich_pitch_count(g)
@@ -747,18 +775,38 @@ class TidbytBaseballPlugin(BasePlugin):
             if live_games:
                 g0 = live_games[0]
                 self.logger.info(
-                    f"Fetched scoreboard OK: {len(live_games)} live game(s). "
-                    f"First: {g0['away_abbr']}@{g0['home_abbr']} "
+                    f"Fetched scoreboard OK: {len(live_games)} live game(s), "
+                    f"{len(past_games)} past, {len(upcoming_games)} upcoming. "
+                    f"First live: {g0['away_abbr']}@{g0['home_abbr']} "
                     f"{g0['away_score']}-{g0['home_score']}, count {g0['balls']}-{g0['strikes']}, "
                     f"outs {g0['outs']}, batter={g0.get('batter_short_name') or g0.get('batter_name')}"
                 )
             else:
-                self.logger.info("Fetched scoreboard OK: no live games right now.")
+                self.logger.info(
+                    f"Fetched scoreboard OK: no live games right now. "
+                    f"{len(past_games)} past, {len(upcoming_games)} upcoming."
+                )
+
+            # This is what actually gets rotated through and displayed.
+            # Live games always take priority; past/upcoming are appended
+            # if enabled. If none of those have anything, fall back to
+            # the single best-guess favorite-team game (old behavior,
+            # preserved for when the new game types are off or empty).
+            rotation_games = list(live_games)
+            if self.show_past_games:
+                rotation_games += past_games
+            if self.show_upcoming_games:
+                rotation_games += upcoming_games
+            if not rotation_games and fallback_game:
+                rotation_games = [fallback_game]
 
             with self._data_lock:
                 self.live_games = live_games
+                self.past_games = past_games
+                self.upcoming_games = upcoming_games
                 self.fallback_game = fallback_game
-                if self.current_index >= len(self.live_games):
+                self.rotation_games = rotation_games
+                if self.current_index >= len(self.rotation_games):
                     self.current_index = 0
         except Exception as e:
             self.logger.error(
@@ -774,9 +822,12 @@ class TidbytBaseballPlugin(BasePlugin):
         """Detects when a game has a NEW play (by comparing lastPlay's
         id against what we last saw for this specific game, keyed by
         event_id since game dicts are rebuilt fresh every poll) and, if
-        it's a "significant" play type, sets a flash window during
-        which display() shows the play text instead of the normal
-        right-half layout.
+        it's a "significant" play type, QUEUES it to be flashed. The
+        actual timing/expiry is handled by _service_flash_queue(),
+        called from display() before rotation -- this function only
+        decides WHETHER something should flash, never when or for how
+        long, since that's what guarantees it's actually shown (see the
+        big comment on _pending_flash_event_ids in __init__).
 
         Deliberately does NOT flash the very first time we ever see a
         given game (i.e., when we have no previous play id to compare
@@ -804,11 +855,51 @@ class TidbytBaseballPlugin(BasePlugin):
                 or play_type not in NON_SIGNIFICANT_PLAY_TYPES
             )
             if is_significant:
-                self._flash_until[event_id] = time.time() + self.last_play_display_seconds
+                already_active = self._active_flash and self._active_flash.get("event_id") == event_id
+                already_pending = event_id in self._pending_flash_event_ids
+                if not already_active and not already_pending:
+                    self._pending_flash_event_ids.append(event_id)
+                    self.logger.info(
+                        f"Last-play flash QUEUED for {game['away_abbr']}@{game['home_abbr']}: "
+                        f"\"{game.get('last_play_text')}\" (type={play_type})"
+                    )
+
+    def _service_flash_queue(self) -> Optional[Dict[str, Any]]:
+        """Called from display(), before rotation. Returns a dict with
+        the active flash's event_id/started_at/duration for this
+        frame, or None if nothing's flashing. Also promotes the next
+        queued flash (if any) into the active slot, force-jumping
+        current_index to that game so it's guaranteed to actually be
+        displayed rather than hoping normal rotation gets there before
+        the flash would've expired -- that race condition was the
+        actual bug behind the flash "only working intermittently"
+        during multi-game nights."""
+        with self._data_lock:
+            now = time.time()
+            if self._active_flash and now >= self._active_flash["expires_at"]:
+                self._active_flash = None
+                self.last_switch_time = now  # give normal rotation a fresh full window right after
+
+            if self._active_flash is None and self._pending_flash_event_ids:
+                next_event_id = self._pending_flash_event_ids.pop(0)
+                self._active_flash = {
+                    "event_id": next_event_id,
+                    "started_at": now,
+                    "duration": self.last_play_display_seconds,
+                    "expires_at": now + self.last_play_display_seconds,
+                }
+                matched = False
+                for idx, g in enumerate(self.rotation_games):
+                    if g.get("event_id") == next_event_id:
+                        self.current_index = idx
+                        matched = True
+                        break
                 self.logger.info(
-                    f"Last-play flash triggered for {game['away_abbr']}@{game['home_abbr']}: "
-                    f"\"{game.get('last_play_text')}\" (type={play_type})"
+                    f"Last-play flash NOW SHOWING (event_id={next_event_id}, "
+                    f"matched to a currently-live game: {matched})"
                 )
+
+            return dict(self._active_flash) if self._active_flash else None
 
     def _enrich_pitch_count(self, game: Dict[str, Any]):
         """Fetches ESPN's detailed per-game summary endpoint and tries
@@ -931,6 +1022,8 @@ class TidbytBaseballPlugin(BasePlugin):
     def _process_scoreboard(self, data: Dict[str, Any]):
         events = data.get("events", [])
         live_games = []
+        past_games = []
+        upcoming_games = []
 
         for event in events:
             competitions = event.get("competitions", [])
@@ -938,20 +1031,37 @@ class TidbytBaseballPlugin(BasePlugin):
                 continue
             comp = competitions[0]
             state = comp.get("status", {}).get("type", {}).get("state")
-            if state != "in":
-                continue
-            game = self._parse_game(event, comp)
-            if self.show_favorite_teams_only:
-                if game["away_abbr"] in self.favorite_teams or game["home_abbr"] in self.favorite_teams:
+            competitors = comp.get("competitors", [])
+            abbrevs = [c.get("team", {}).get("abbreviation", "").upper() for c in competitors]
+            involves_favorite = any(fav in abbrevs for fav in self.favorite_teams)
+
+            if state == "in":
+                game = self._parse_game(event, comp, game_type="live")
+                if self.show_favorite_teams_only:
+                    if involves_favorite:
+                        live_games.append(game)
+                else:
                     live_games.append(game)
-            else:
-                live_games.append(game)
+            elif state == "post" and self.show_past_games and involves_favorite:
+                past_games.append(self._parse_game(event, comp, game_type="final"))
+            elif state == "pre" and self.show_upcoming_games and involves_favorite:
+                upcoming_games.append(self._parse_game(event, comp, game_type="upcoming"))
+
+        past_games = past_games[: self.max_past_games]
+
+        # Explicitly requested: upcoming games shown in start-time order.
+        # Sorting by the raw ISO8601 UTC string (rather than the
+        # formatted local date_str/time_str) sorts correctly across
+        # date/month boundaries since ISO8601 sorts chronologically as
+        # a plain string comparison.
+        upcoming_games.sort(key=lambda g: g.get("event_date_raw") or "")
+        upcoming_games = upcoming_games[: self.max_upcoming_games]
 
         fallback_game = None
-        if not live_games:
+        if not live_games and not past_games and not upcoming_games:
             fallback_game = self._find_favorite_game(data)
 
-        return live_games, fallback_game
+        return live_games, past_games, upcoming_games, fallback_game
 
     def _find_favorite_game(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         events = data.get("events", [])
@@ -968,9 +1078,33 @@ class TidbytBaseballPlugin(BasePlugin):
         if not candidates:
             return None
         event, comp = candidates[0]
-        return self._parse_game(event, comp)
+        state = comp.get("status", {}).get("type", {}).get("state")
+        game_type = {"in": "live", "post": "final", "pre": "upcoming"}.get(state, "upcoming")
+        return self._parse_game(event, comp, game_type=game_type)
 
-    def _parse_game(self, event: Dict[str, Any], comp: Dict[str, Any]) -> Dict[str, Any]:
+    def _format_game_datetime(self, event: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """Parses ESPN's event.date (ISO8601 UTC, e.g.
+        "2026-07-12T23:10Z") and formats it as separate (date, time)
+        strings in the system's local timezone -- assumes the Pi's
+        system clock/timezone is set correctly, which is the normal
+        case for a home device. Returns (None, None) if the field is
+        missing or unparseable rather than crashing."""
+        raw = event.get("date")
+        if not raw:
+            return None, None
+        try:
+            iso = raw.replace("Z", "+00:00")
+            dt_utc = datetime.datetime.fromisoformat(iso)
+            dt_local = dt_utc.astimezone()
+            date_str = f"{dt_local.month}/{dt_local.day}"
+            hour_12 = dt_local.hour % 12 or 12
+            ampm = "AM" if dt_local.hour < 12 else "PM"
+            time_str = f"{hour_12}:{dt_local.minute:02d} {ampm}"
+            return date_str, time_str
+        except Exception:
+            return None, None
+
+    def _parse_game(self, event: Dict[str, Any], comp: Dict[str, Any], game_type: str = "live") -> Dict[str, Any]:
         competitors = comp.get("competitors", [])
         away = next((c for c in competitors if c.get("homeAway") == "away"), competitors[0])
         home = next((c for c in competitors if c.get("homeAway") == "home"), competitors[-1])
@@ -1083,8 +1217,13 @@ class TidbytBaseballPlugin(BasePlugin):
         pitcher_full, pitcher_short = extract_pitcher_info(situation)
         pitch_count = extract_pitch_count(situation)
         last_play_id, last_play_text, last_play_type = extract_last_play(situation)
+        game_date_str, game_time_str = self._format_game_datetime(event)
 
         return {
+            "game_type": game_type,
+            "event_date_raw": event.get("date"),
+            "game_date_str": game_date_str,
+            "game_time_str": game_time_str,
             "state": status_type.get("state", "pre"),
             "away_abbr": away.get("team", {}).get("abbreviation", "AWY")[:3].upper(),
             "home_abbr": home.get("team", {}).get("abbreviation", "HOM")[:3].upper(),
@@ -1152,20 +1291,20 @@ class TidbytBaseballPlugin(BasePlugin):
     # ------------------------------------------------------------------
     def _maybe_rotate(self):
         with self._data_lock:
-            if len(self.live_games) <= 1:
+            if len(self.rotation_games) <= 1:
                 return
             now = time.time()
             if now - self.last_switch_time >= self.game_rotation_seconds:
-                self.current_index = (self.current_index + 1) % len(self.live_games)
+                self.current_index = (self.current_index + 1) % len(self.rotation_games)
                 self.last_switch_time = now
 
     def _current_game(self) -> Optional[Dict[str, Any]]:
         with self._data_lock:
-            if self.live_games:
+            if self.rotation_games:
                 # index is guarded above/in _maybe_refresh, but clamp
-                # defensively in case live_games shrank between calls
-                idx = min(self.current_index, len(self.live_games) - 1)
-                return self.live_games[idx]
+                # defensively in case rotation_games shrank between calls
+                idx = min(self.current_index, len(self.rotation_games) - 1)
+                return self.rotation_games[idx]
             return self.fallback_game
 
     # ------------------------------------------------------------------
@@ -1227,7 +1366,9 @@ class TidbytBaseballPlugin(BasePlugin):
     # Rendering
     # ------------------------------------------------------------------
     def display(self, force_clear: bool = False):
-        self._maybe_rotate()
+        active_flash = self._service_flash_queue()
+        if active_flash is None:
+            self._maybe_rotate()
 
         width, height = self._get_dimensions()
         image = Image.new("RGB", (width, height), (0, 0, 0))
@@ -1242,7 +1383,18 @@ class TidbytBaseballPlugin(BasePlugin):
         left_w = width // 2
         col_w = left_w // 2
 
+        game_type = game.get("game_type", "live")
+
         try:
+            if game_type == "final":
+                self._render_final_game(image, draw, game, width, height)
+                self._push_image(image, force_clear)
+                return
+            elif game_type == "upcoming":
+                self._render_upcoming_game(image, draw, game, width, height)
+                self._push_image(image, force_clear)
+                return
+
             # Swapped per request: the darker shade now sits behind the
             # logo (better contrast so light/white logo elements don't
             # wash out against a bright saturated color), and the full
@@ -1273,15 +1425,23 @@ class TidbytBaseballPlugin(BasePlugin):
             right_w = width - right_x0 - 1
 
             event_id = game.get("event_id")
-            with self._data_lock:
-                flash_until = self._flash_until.get(event_id, 0) if event_id else 0
-            show_flash = time.time() < flash_until
+            show_flash = active_flash is not None and event_id == active_flash["event_id"]
 
             if show_flash:
-                self._draw_last_play(
-                    image, draw, right_x0, 0, right_w, height,
-                    game.get("last_play_text") or "", fill=(255, 255, 255),
-                )
+                play_type = (game.get("last_play_type") or "").lower()
+                if play_type in HOME_RUN_PLAY_TYPES:
+                    elapsed = time.time() - active_flash["started_at"]
+                    batting_color = game["away_color"] if game["inning_half"] else game["home_color"]
+                    self._draw_home_run_animation(
+                        image, draw, right_x0, 0, right_w, height,
+                        game.get("last_play_text") or "", elapsed, active_flash["duration"],
+                        batting_color, seed=event_id or "hr",
+                    )
+                else:
+                    self._draw_last_play(
+                        image, draw, right_x0, 0, right_w, height,
+                        game.get("last_play_text") or "", fill=(255, 255, 255),
+                    )
             else:
                 top_margin = 1
                 lower_y = height - 6  # bottom-row (count/batter) text measures ~5px tall
@@ -1384,6 +1544,96 @@ class TidbytBaseballPlugin(BasePlugin):
                 return int(w), int(h)
         return 128, 32
 
+    def _render_final_game(self, image, draw, game, width, height):
+        """Completed game: normal team columns, but the WINNING team's
+        bar is highlighted yellow instead of its usual team color, and
+        the black half just shows "FINAL" centered -- no diamond/
+        inning/etc, since there's no live situation to show."""
+        left_w = width // 2
+        col_w = left_w // 2
+
+        draw.rectangle([0, 0, col_w - 1, height - 1], fill=self._darken_color(game["away_color"]))
+        draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=self._darken_color(game["home_color"]))
+
+        away_text = f"{game['away_abbr']} {game['away_score']}"
+        home_text = f"{game['home_abbr']} {game['home_score']}"
+        available_text_width = col_w - 4
+        shared_font = self._fit_font_for_pair(draw, away_text, home_text, available_text_width, start_size=10)
+
+        yellow = (255, 200, 0)
+        away_won = game["away_score"] > game["home_score"]
+        home_won = game["home_score"] > game["away_score"]
+
+        away_txt_color = self._text_color_for(yellow) if away_won else self._text_color_for(game["away_color"])
+        home_txt_color = self._text_color_for(yellow) if home_won else self._text_color_for(game["home_color"])
+
+        self._draw_team_column(image, draw, 0, 0, col_w, height,
+                                game["away_abbr"], game["away_score"], game.get("away_logo"),
+                                away_txt_color, game["away_color"], shared_font,
+                                bar_color_override=yellow if away_won else None)
+        self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
+                                game["home_abbr"], game["home_score"], game.get("home_logo"),
+                                home_txt_color, game["home_color"], shared_font,
+                                bar_color_override=yellow if home_won else None)
+
+        right_x0 = left_w + 2
+        right_w = width - right_x0 - 1
+        font = self._load_font(10, bold=True)
+        text = "FINAL"
+        bbox = self._measure(font, text)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        tx = right_x0 + max((right_w - tw) // 2, 0)
+        ty = max((height - th) // 2, 0) - bbox[1]
+        self._render_text(image, (tx, ty), text, font, (255, 255, 255))
+
+    def _render_upcoming_game(self, image, draw, game, width, height):
+        """Scheduled game that hasn't started: team columns show only
+        the abbreviation (no score -- there isn't one yet), and the
+        black half shows "UPCOMING" with the game's date and start time
+        (in local system time) below it."""
+        left_w = width // 2
+        col_w = left_w // 2
+
+        draw.rectangle([0, 0, col_w - 1, height - 1], fill=self._darken_color(game["away_color"]))
+        draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=self._darken_color(game["home_color"]))
+
+        away_txt_color = self._text_color_for(game["away_color"])
+        home_txt_color = self._text_color_for(game["home_color"])
+
+        available_text_width = col_w - 4
+        shared_font = self._fit_font_for_pair(draw, game["away_abbr"], game["home_abbr"], available_text_width, start_size=10)
+
+        self._draw_team_column(image, draw, 0, 0, col_w, height,
+                                game["away_abbr"], game["away_score"], game.get("away_logo"),
+                                away_txt_color, game["away_color"], shared_font, show_score=False)
+        self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
+                                game["home_abbr"], game["home_score"], game.get("home_logo"),
+                                home_txt_color, game["home_color"], shared_font, show_score=False)
+
+        right_x0 = left_w + 2
+        right_w = width - right_x0 - 1
+
+        title_font = self._load_font(8, bold=True)
+        title = "UPCOMING"
+        tbbox = self._measure(title_font, title)
+        tw = tbbox[2] - tbbox[0]
+        tx = right_x0 + max((right_w - tw) // 2, 0)
+        ty = 2 - tbbox[1]
+        self._render_text(image, (tx, ty), title, title_font, (255, 255, 255))
+
+        info_font = self._load_font(7, bold=False)
+        date_str = game.get("game_date_str")
+        time_str = game.get("game_time_str")
+        cursor_y = ty + (tbbox[3] - tbbox[1]) + 4
+
+        for line in filter(None, [date_str, time_str]):
+            lbbox = self._measure(info_font, line)
+            lw = lbbox[2] - lbbox[0]
+            lx = right_x0 + max((right_w - lw) // 2, 0)
+            ly = cursor_y - lbbox[1]
+            self._render_text(image, (lx, ly), line, info_font, (200, 200, 200))
+            cursor_y += (lbbox[3] - lbbox[1]) + 2
+
     def _push_image(self, image: Image.Image, force_clear: bool):
         dm = self.display_manager
         if hasattr(dm, "image") and hasattr(dm, "update_display"):
@@ -1432,13 +1682,19 @@ class TidbytBaseballPlugin(BasePlugin):
 
 
 
-    def _draw_team_column(self, image, draw, x0, y0, w, h, abbr, score, logo, text_color, bg_color, font):
+    def _draw_team_column(self, image, draw, x0, y0, w, h, abbr, score, logo, text_color, bg_color, font,
+                          bar_color_override=None, show_score=True):
         """Logo fills nearly the whole column (as large as the panel
         allows); a darkened bar across the bottom holds the bold
         'ABBR SCORE' text so it stays legible over the logo. `font` is
         computed once by the caller from BOTH columns' text, so the two
-        teams always render at the same size."""
-        text_line = f"{abbr} {score}"
+        teams always render at the same size.
+
+        `bar_color_override`: used for final (completed) games to
+        highlight the winning team's bar in yellow instead of its
+        normal team color. `show_score`: set False for upcoming games,
+        which don't have a score yet -- shows just the abbreviation."""
+        text_line = f"{abbr} {score}" if show_score else abbr
         line_bbox = self._measure(font, text_line)
         line_h = line_bbox[3] - line_bbox[1]
         line_w = line_bbox[2] - line_bbox[0]
@@ -1454,7 +1710,7 @@ class TidbytBaseballPlugin(BasePlugin):
             image.paste(logo, (logo_x, logo_y), logo)
 
         bar_y0 = y0 + h - bar_h
-        bar_color = bg_color  # swapped: bright team color now backs the text, not the logo
+        bar_color = bar_color_override if bar_color_override is not None else bg_color
         draw.rectangle([x0, bar_y0, x0 + w - 1, y0 + h - 1], fill=bar_color)
 
         tx = x0 + max((w - line_w) // 2, 0)
@@ -1571,6 +1827,163 @@ class TidbytBaseballPlugin(BasePlugin):
                 current = word
         lines.append(current)
         return lines
+
+    def _draw_home_run_animation(self, image, draw, x0, y0, w, h, play_text: str,
+                                  elapsed: float, duration: float, team_color, seed: str):
+        """Three-phase home run animation, sequenced within the total
+        flash duration:
+          1. Ball arc -- a small ball traces a parabolic path across
+             the box and exits, representing the moment of contact.
+          2. Strobing flash -- background alternates black/team-color
+             with bold "HOME RUN!" text, an immediate high-contrast hit.
+          3. Firework bursts + play text -- settles into a calmer black
+             background with recurring particle bursts and the actual
+             play description wrapped below "HOME RUN!".
+
+        Phase lengths scale proportionally to `duration` (clamped to
+        sensible min/max) so this still looks reasonable whether
+        last_play_display_seconds is short or long."""
+        phase1_len = max(min(duration * 0.25, 1.5), 0.6)
+        phase2_len = max(min(duration * 0.20, 1.2), 0.5)
+        phase3_start = phase1_len + phase2_len
+
+        if elapsed < phase1_len:
+            draw.rectangle([x0, y0, x0 + w - 1, y0 + h - 1], fill=(0, 0, 0))
+            self._draw_ball_arc(image, x0, y0, w, h, elapsed / phase1_len)
+        elif elapsed < phase3_start:
+            self._draw_strobe_flash(image, draw, x0, y0, w, h, elapsed - phase1_len, team_color)
+        else:
+            self._draw_fireworks_with_text(image, draw, x0, y0, w, h, elapsed - phase3_start, play_text, seed)
+
+    def _draw_ball_arc(self, image, x0, y0, w, h, progress: float):
+        """Traces a small ball along a parabolic arc from the left
+        edge, peaking in the middle, exiting past the right edge --
+        with a short fading trail behind it."""
+        progress = max(0.0, min(1.0, progress))
+        trail_len = 5
+        for i in range(trail_len, 0, -1):
+            p = progress - i * 0.025
+            if p < 0:
+                continue
+            bx = x0 + int(p * (w + 6)) - 3
+            by = y0 + (h - 2) - int((h - 4) * (1 - (2 * p - 1) ** 2))
+            fade = max(0, 200 - i * 45)
+            if 0 <= bx < image.width and 0 <= by < image.height:
+                image.putpixel((bx, by), (fade, fade, 0))
+
+        bx = x0 + int(progress * (w + 6)) - 3
+        by = y0 + (h - 2) - int((h - 4) * (1 - (2 * progress - 1) ** 2))
+        draw = ImageDraw.Draw(image)
+        if x0 - 2 <= bx <= x0 + w + 2 and y0 - 2 <= by <= y0 + h + 2:
+            draw.ellipse([bx - 1, by - 1, bx + 1, by + 1], fill=(255, 255, 255))
+
+    def _draw_strobe_flash(self, image, draw, x0, y0, w, h, t: float, team_color):
+        """Alternates the whole box between black and the batting
+        team's color a few times per second, with bold white/gold
+        'HOME RUN!' text staying steady on top."""
+        strobe_on = int(t * 4) % 2 == 0
+        bg = team_color if strobe_on else (0, 0, 0)
+        draw.rectangle([x0, y0, x0 + w - 1, y0 + h - 1], fill=bg)
+
+        text_color = (255, 255, 255) if strobe_on else (255, 215, 0)
+        font = self._load_font(9, bold=True)
+        text = "HOME RUN!"
+        bbox = self._measure(font, text)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        tx = x0 + max((w - tw) // 2, 0)
+        ty = y0 + max((h - th) // 2, 0)
+        self._render_text(image, (tx, ty), text, font, text_color)
+
+    def _draw_fireworks(self, image, x0, y0, w, h, t: float, seed: str,
+                         num_bursts: int = 2, particles_per_burst: int = 8, burst_period: float = 0.9):
+        """A couple of recurring particle bursts radiating outward from
+        random (but seed-fixed, so consistent across frames of the same
+        flash) center points, fading out and looping every burst_period
+        seconds for continued visual interest through the settled phase."""
+        rng = random.Random(seed)
+        colors = [(255, 90, 0), (255, 215, 0), (255, 255, 255), (80, 180, 255)]
+        for b in range(num_bursts):
+            center_x = x0 + rng.randint(int(w * 0.2), int(w * 0.8))
+            center_y = y0 + rng.randint(int(h * 0.15), int(h * 0.6))
+            color = colors[rng.randint(0, len(colors) - 1)]
+            offset = rng.uniform(0, burst_period)
+            cycle_t = (t + offset) % burst_period
+            fade = max(0.0, 1.0 - cycle_t / (burst_period * 0.85))
+            if fade <= 0:
+                continue
+            for p in range(particles_per_burst):
+                angle = (2 * math.pi * p / particles_per_burst) + b
+                speed = 5 + (p % 3) * 2
+                dist = speed * cycle_t
+                px = int(center_x + dist * math.cos(angle))
+                py = int(center_y + dist * math.sin(angle) * 0.7)  # slightly flattened, more natural at this aspect ratio
+                if x0 <= px < x0 + w and y0 <= py < y0 + h:
+                    c = tuple(max(int(ch * fade), 0) for ch in color)
+                    image.putpixel((px, py), c)
+
+    def _draw_scrolling_text(self, image, x0, y0, w, h, text: str, font, fill, t: float,
+                              speed_px_per_sec: float = 18.0, gap: int = 16):
+        """Draws `text` on a single line, vertically centered. If it
+        fits within `w` as-is, it's just centered and static -- no
+        need to scroll short text. If it's wider than the box, it
+        scrolls continuously leftward (looping) based on elapsed time
+        `t`, so long play descriptions are never cut off, just take a
+        few seconds to fully read.
+
+        Renders onto a scratch canvas exactly the size of the box, then
+        pastes that onto the real image -- this is what guarantees the
+        scrolling text can never bleed outside its box (e.g. into the
+        team panels on the left) regardless of how far negative the
+        scroll offset gets or which font backend is active. PIL's
+        draw.text() only clips to the full target image's bounds, not
+        to an arbitrary sub-region, so without this a wide negative
+        offset could draw well outside the intended box."""
+        if not text or w <= 0 or h <= 0:
+            return
+        bbox = self._measure(font, text)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        scratch = Image.new("RGB", (w, h), (0, 0, 0))
+        ty = max((h - th) // 2, 0) - bbox[1]
+
+        if tw <= w:
+            tx = max((w - tw) // 2, 0)
+            self._render_text(scratch, (tx, ty), text, font, fill)
+        else:
+            loop_dist = w + tw + gap
+            progress = (t * speed_px_per_sec) % loop_dist
+            tx = int(round(w - progress))
+            self._render_text(scratch, (tx, ty), text, font, fill)
+
+        image.paste(scratch, (x0, y0))
+
+    def _draw_fireworks_with_text(self, image, draw, x0, y0, w, h, t: float, play_text: str, seed: str):
+        """Settled celebration phase: black background, recurring
+        firework bursts confined to the upper portion, 'HOME RUN!'
+        steady beneath them, and the actual play description scrolling
+        along the bottom -- scrolling rather than the wrap/shrink/
+        truncate approach used elsewhere, since this row only has
+        room for a single line and a long description would otherwise
+        get cut off or shrunk to near-illegibility."""
+        draw.rectangle([x0, y0, x0 + w - 1, y0 + h - 1], fill=(0, 0, 0))
+
+        fireworks_h = int(h * 0.55)
+        self._draw_fireworks(image, x0, y0, w, fireworks_h, t, seed)
+
+        font = self._load_font(7, bold=True)
+        title = "HOME RUN!"
+        tbbox = self._measure(font, title)
+        tw = tbbox[2] - tbbox[0]
+        tx = x0 + max((w - tw) // 2, 0)
+        ty = y0 + fireworks_h
+        self._render_text(image, (tx, ty), title, font, (255, 215, 0))
+
+        if play_text:
+            desc_y0 = ty + (tbbox[3] - tbbox[1]) + 2
+            desc_h = max(h - (desc_y0 - y0), 0)
+            if desc_h > 4:
+                desc_font = self._load_font(7, bold=False)
+                self._draw_scrolling_text(image, x0, desc_y0, w, desc_h, play_text, desc_font, (200, 200, 200), t)
 
     def _draw_last_play(self, image, draw, x0, y0, w, h, text: str, fill=(255, 255, 255)):
         """Word-wraps `text` (a full play description, e.g. "Aaron

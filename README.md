@@ -131,17 +131,23 @@ See `config_schema.json` for the full list.
 | Key | Default | Notes |
 |---|---|---|
 | `favorite_teams` | `["PHI"]` | Fallback game + rotation filter if restricted |
-| `show_favorite_teams_only` | `false` | Restrict rotation to favorite teams' live games |
-| `game_rotation_seconds` | `8` | How long each live game shows before switching |
+| `show_favorite_teams_only` | `false` | Restrict live rotation to favorite teams' games |
+| `game_rotation_seconds` | `8` | How long each game shows before switching |
 | `update_interval_seconds` | `300` | Poll rate when nothing is live |
 | `live_update_interval_seconds` | `15` | Poll rate while games are live |
+| `away_color` / `home_color` | white / white | Fallback colors if `use_team_colors` can't find one |
 | `use_team_colors` | `true` | Pull real team colors from ESPN |
 | `show_logos` | `true` | Show team logos |
 | `logo_dir` | `assets/sports/mlb_logos` | Local logo folder, checked before ESPN |
 | `base_fill_color` / `base_empty_color` | white / grey | Diamond colors |
 | `out_fill_color` / `out_empty_color` | orange / grey | Outs indicator colors |
-| `font_choice` | `5by7` | `5by7`, `4x6`, `press_start_2p`, or `system` |
 | `show_batter_name` | `true` | Show current batter next to the count |
+| `show_last_play` | `true` | Flash the last play for significant moments |
+| `last_play_display_seconds` | `5` | How long the last-play flash stays up |
+| `last_play_filter` | `significant` | `significant` or `all` |
+| `show_past_games` | `false` | Include recent final favorite-team games in rotation |
+| `show_upcoming_games` | `false` | Include upcoming favorite-team games in rotation |
+| `max_past_games` / `max_upcoming_games` | `3` / `3` | Caps on how many of each to include |
 | `test_mode` | `false` | Render a fake game for layout testing |
 
 ## If text still looks wrong / blocky / generic on real hardware
@@ -209,7 +215,167 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
-## New: last-play overlay
+## Config cleanup
+
+- `away_color`/`home_color` fallback defaults changed to white
+  (`[255,255,255]`) per request.
+- `font_choice` removed entirely as a user setting -- `tom_thumb` is
+  now hardcoded as the only font. The internal fallback chain (other
+  bundled TTFs, system fonts, PIL's default) still exists for
+  robustness if BDF somehow fails to load, it's just no longer
+  something you pick.
+
+## New: past games and upcoming games
+
+Two new game types can now appear in rotation alongside live games:
+
+- **Past (final) games** (`show_past_games`): recently completed
+  favorite-team games. The WINNING team's bottom bar is highlighted
+  yellow (`255, 200, 0`) instead of its normal team color, and the
+  black half shows "FINAL" centered -- no diamond/inning/etc, since
+  there's no live situation to show.
+- **Upcoming games** (`show_upcoming_games`): scheduled favorite-team
+  games, always shown in start-time order (sorted by ESPN's raw
+  ISO8601 date string, which sorts correctly across date/month
+  boundaries as a plain string comparison -- not by the formatted
+  local date, which wouldn't). Team columns show only the abbreviation
+  (no score number, since the game hasn't happened yet). The black
+  half shows "UPCOMING" with the game's date and local start time
+  below it.
+
+Both are **filtered to your favorite teams only**, regardless of the
+`show_favorite_teams_only` setting (which governs live-game rotation
+scope) -- showing every past/upcoming MLB game league-wide would be
+dozens of entries per day, so this only makes sense scoped to teams
+you actually follow. Capped at `max_past_games`/`max_upcoming_games`
+(default 3 each) to keep rotation length reasonable.
+
+**How rotation works now**: live games always take priority and
+appear first; past/upcoming games (if enabled) are appended after.
+If none of those have anything (no live games, and past/upcoming are
+off or empty), it falls back to the single best-guess favorite-team
+game -- the same fallback behavior from before this feature existed.
+
+**Local time assumption**: start times convert from ESPN's UTC
+timestamp to your system's local timezone via Python's `astimezone()`
+-- this assumes your Pi's system clock/timezone is configured
+correctly, which is the normal case for a home device.
+
+Verified with actual rendering and pixel checks, not just code review:
+confirmed the winning team's bar is measurably yellow while the losing
+team's stays its normal color; confirmed the upcoming-game team text
+is measurably narrower than the same team with a score shown
+(proving the score is genuinely omitted, not just visually similar);
+confirmed past-game filtering excludes non-favorite-team games and
+upcoming-game sorting/capping both work correctly against synthetic
+multi-game scoreboard data; and confirmed existing live-game rendering
+is completely unaffected by all this restructuring.
+
+
+
+The bottom row of phase 3 (play description under "HOME RUN!") used
+the same wrap/shrink/truncate logic as the plain last-play overlay --
+fine there, but this row only has room for a single line, so a long
+description would get aggressively shrunk or truncated with an
+ellipsis. Replaced with `_draw_scrolling_text`: short text just
+displays centered and static, but text wider than the box scrolls
+continuously (looping) using the same time-based approach as the rest
+of the animation, so nothing is ever cut off -- long descriptions just
+take a few seconds longer to fully read.
+
+Caught a real bug while building this: the scroll position is
+naturally a float (from the time-based math), but `BDFFont.draw()`
+needs integer pixel coordinates for `putpixel()` -- confirmed by
+actually running it and hitting a `TypeError`, not just by inspection.
+Fixed by rounding to the nearest int before rendering.
+
+Also renders onto a scratch canvas sized exactly to the text's box,
+then pastes that onto the real image -- this guarantees the scrolling
+text can never bleed outside its intended area (e.g. into the team
+panels) even at large negative offsets, since PIL's `draw.text()` only
+clips to the full target image's bounds, not to an arbitrary
+sub-region.
+
+Verified directly: confirmed scroll position measurably changes across
+time samples while staying within the box's pixel bounds throughout,
+and confirmed short text (that fits without scrolling) renders
+identically across different time values rather than jittering
+unnecessarily.
+
+
+
+When the last-play flash triggers for a home run specifically, it now
+plays a three-phase animated sequence instead of the plain text
+overlay, sequenced within the total `last_play_display_seconds` window
+(phase lengths scale proportionally, so this still looks reasonable
+whether that's set short or long):
+
+1. **Ball arc** -- a small ball traces a parabolic path across the
+   panel with a short fading trail, representing the moment of contact.
+2. **Strobing flash** -- background alternates black/batting-team-color
+   a few times per second, bold "HOME RUN!" text staying steady on top.
+3. **Firework bursts + play text** -- settles into a black background
+   with a couple of recurring particle bursts, "HOME RUN!" steady
+   beneath them, and the actual play description word-wrapped at the
+   bottom.
+
+All three phases are pure functions of elapsed time (`time.time()`),
+not persistent per-frame state, so they animate smoothly regardless of
+however often `display()` happens to get called.
+
+**Detection caveat, same pattern as pitch count/last-play**: I do NOT
+have a confirmed real sample of ESPN's home-run type code (unlike
+`NON_SIGNIFICANT_PLAY_TYPES`, where "ball" and "start-batterpitcher"
+are both confirmed). `HOME_RUN_PLAY_TYPES` is a best-effort guess
+(`"home-run"`, `"homerun"`, `"home_run"`, `"hr"`, `"home run"`). If a
+real home run doesn't trigger the animation (falls back to the plain
+text overlay instead), check the logs for the `"Last-play flash
+QUEUED for ... (type=...)"` line during that play and add the actual
+type string to `HOME_RUN_PLAY_TYPES` in `manager.py`.
+
+Verified each phase renders distinctly and correctly via direct pixel
+checks (not just visual inspection): phase 1's ball position measurably
+moves rightward over time, phase 2's background measurably toggles
+between team color and black, phase 3 shows both firework-colored
+particles and the "HOME RUN!" text simultaneously. Also confirmed a
+non-home-run significant play (e.g. a double) still correctly falls
+back to the plain text overlay rather than triggering the animation.
+
+
+
+**Root cause confirmed** (not a data/filter problem): the original
+design set a per-game wall-clock expiry (`flash_until = now + 5s`) the
+moment a significant play was DETECTED, completely independent of
+whether that game happened to be on screen. Normal rotation runs on
+its own separate timer with zero awareness of pending flashes. With 2+
+live games rotating, a flash could easily expire before rotation ever
+got around to actually showing that game -- so whether you saw it came
+down to unlucky timing, not whether the play was detected correctly.
+Even when the currently-displayed game got the play, rotation could
+still switch away mid-flash and cut it short.
+
+**Fixed**: replaced the per-game timer with a queue (`_pending_flash_event_ids`)
+and a single "active" slot (`_active_flash`), serviced by
+`_service_flash_queue()` -- called every frame, BEFORE rotation. When
+a significant play is queued, it force-jumps `current_index` to that
+specific game (interrupting whatever rotation was about to show) and
+pauses normal rotation until the flash's duration naturally expires,
+at which point rotation gets a fresh window and resumes normally. If
+two games get significant plays close together, both queue up and get
+shown one after another rather than one clobbering the other.
+
+Verified with real scenarios, not just code review:
+- A home run on a game that's NOT currently displayed correctly forces
+  an immediate jump to that game (confirmed the display doesn't just
+  keep showing whatever was already active and silently drop the play)
+- Rotation stays locked on the flashing game for its full duration even
+  with a very short rotation interval that would otherwise want to
+  switch away
+- Rotation resumes normally immediately after the flash expires
+- Two simultaneous significant plays on different games both get shown
+  in sequence, neither one lost
+
+
 
 When something significant happens (hit, walk, strikeout, out, run
 scored), the black half temporarily shows the play description instead

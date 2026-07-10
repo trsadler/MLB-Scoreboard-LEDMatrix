@@ -52,9 +52,9 @@
         "type": "integer"
       },
       "default": [
-        0,
-        142,
-        226
+        255,
+        255,
+        255
       ],
       "description": "RGB fallback color for the away team column"
     },
@@ -64,9 +64,9 @@
         "type": "integer"
       },
       "default": [
-        200,
-        16,
-        46
+        255,
+        255,
+        255
       ],
       "description": "RGB fallback color for the home team column"
     },
@@ -138,18 +138,6 @@
       "default": false,
       "description": "Render a fake in-progress game instead of calling ESPN (for layout testing)"
     },
-    "font_choice": {
-      "type": "string",
-      "enum": [
-        "5by7",
-        "4x6",
-        "press_start_2p",
-        "tom_thumb",
-        "system"
-      ],
-      "default": "tom_thumb",
-      "description": "Pixel font for team abbreviation/score text, bundled directly with this plugin. 5by7 and 4x6 are compact TrueType pixel fonts. tom_thumb is a genuine BDF bitmap font (3x5, MIT licensed) rendered with zero anti-aliasing -- exact pixel-for-pixel, no FreeType rasterization involved. press_start_2p is wider per-character and renders very small in this column. system falls back to a generic bold monospace font."
-    },
     "show_batter_name": {
       "type": "boolean",
       "default": true,
@@ -174,6 +162,28 @@
       ],
       "default": "significant",
       "description": "significant = only flash for hits/walks/strikeouts/outs/runs (skips routine ball/strike/foul updates). all = flash for every single play update including pitch-by-pitch."
+    },
+    "show_past_games": {
+      "type": "boolean",
+      "default": false,
+      "description": "Include recently completed favorite-team games in the rotation, showing the final score with the winning team highlighted in yellow and \"FINAL\" on the black half."
+    },
+    "show_upcoming_games": {
+      "type": "boolean",
+      "default": false,
+      "description": "Include upcoming scheduled favorite-team games in the rotation (in start-time order), showing \"UPCOMING\" plus the date/time on the black half. No score is shown since the game hasn't started."
+    },
+    "max_past_games": {
+      "type": "integer",
+      "default": 3,
+      "minimum": 1,
+      "description": "Maximum number of past (final) favorite-team games to include in rotation"
+    },
+    "max_upcoming_games": {
+      "type": "integer",
+      "default": 3,
+      "minimum": 1,
+      "description": "Maximum number of upcoming favorite-team games to include in rotation"
     }
   },
   "required": [
