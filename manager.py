@@ -522,8 +522,16 @@ class TidbytBaseballPlugin(BasePlugin):
         now = time.time()
         has_data = bool(self.live_games) or self.fallback_game is not None
         interval = self.live_update_interval if self.live_games else self.update_interval
+        seconds_since_last = now - self.last_fetch_time
 
-        if has_data and (now - self.last_fetch_time < interval):
+        if has_data and (seconds_since_last < interval):
+            self.logger.debug(
+                f"update() called but skipping fetch -- only {seconds_since_last:.1f}s since last "
+                f"fetch (interval is {interval}s). If you never see the 'Fetched scoreboard' INFO "
+                f"line below appear again after the first one, update() itself isn't being called "
+                f"often enough by the core scheduler -- possibly only when this plugin's rotation "
+                f"slot comes up, not continuously in the background."
+            )
             return
 
         self.last_fetch_time = now
@@ -545,17 +553,51 @@ class TidbytBaseballPlugin(BasePlugin):
             self.logger.error(f"Failed to fetch MLB scoreboard: {e}", exc_info=True)
             return
 
-        live_games, fallback_game = self._process_scoreboard(data)
+        # IMPORTANT: this whole block used to be unprotected. If any
+        # single game had an unusual shape ESPN sometimes sends
+        # (pitching change, extra innings, a null field mid-play, etc.)
+        # that our parsing code didn't handle, the exception would
+        # propagate straight out of update() uncaught. If the core
+        # scheduler's plugin-calling loop doesn't itself guard against
+        # a plugin's update() throwing, that could silently stop this
+        # plugin from ever updating again -- which matches "the score
+        # itself is also staying frozen" exactly: one bad parse kills
+        # every future refresh, not just that one field. Wrapping this
+        # means a single bad game/response degrades gracefully (keeps
+        # last-known-good data, tries again next interval) instead of
+        # permanently freezing everything.
+        try:
+            live_games, fallback_game = self._process_scoreboard(data)
 
-        for g in live_games:
-            self._resolve_logos(g)
-        if fallback_game:
-            self._resolve_logos(fallback_game)
+            for g in live_games:
+                self._resolve_logos(g)
+            if fallback_game:
+                self._resolve_logos(fallback_game)
 
-        self.live_games = live_games
-        self.fallback_game = fallback_game
-        if self.current_index >= len(self.live_games):
-            self.current_index = 0
+            if live_games:
+                g0 = live_games[0]
+                self.logger.info(
+                    f"Fetched scoreboard OK: {len(live_games)} live game(s). "
+                    f"First: {g0['away_abbr']}@{g0['home_abbr']} "
+                    f"{g0['away_score']}-{g0['home_score']}, count {g0['balls']}-{g0['strikes']}, "
+                    f"outs {g0['outs']}, batter={g0.get('batter_short_name') or g0.get('batter_name')}"
+                )
+            else:
+                self.logger.info("Fetched scoreboard OK: no live games right now.")
+
+            self.live_games = live_games
+            self.fallback_game = fallback_game
+            if self.current_index >= len(self.live_games):
+                self.current_index = 0
+        except Exception as e:
+            self.logger.error(
+                f"Fetched scoreboard successfully but failed to parse/process it: {e}. "
+                f"Keeping last-known-good data instead of crashing -- will try again "
+                f"next update cycle. If this repeats every time, something about the "
+                f"CURRENT game state (extra innings, pitching change, etc.) is hitting "
+                f"a parsing bug -- please share this traceback.",
+                exc_info=True,
+            )
 
     def _process_scoreboard(self, data: Dict[str, Any]):
         events = data.get("events", [])
@@ -626,30 +668,36 @@ class TidbytBaseballPlugin(BasePlugin):
                 return logos[0].get("href")
             return None
 
-        def extract_batter_name(situation_dict):
-            """ESPN's scoreboard payload isn't officially documented, so
-            this tries several plausible shapes for the current batter's
-            name rather than assuming one exact path. Returns None (not
-            a crash) if nothing matches -- the display just omits the
-            batter line in that case. If the actual shape turns out to
-            be something else entirely, check plugin logs for the raw
-            situation keys logged the first time this comes up empty
-            during a live game, and I can add the right path."""
+        def extract_batter_info(situation_dict):
+            """Confirmed against real live-game data (2026-07-09, ATH@DET
+            and SEA@MIA): ESPN's actual structure is
+            situation.batter.athlete.{displayName, fullName, shortName}.
+            shortName comes pre-formatted as "F. Lastname" (e.g.
+            "K. McGonigle") -- prefer that directly over reformatting
+            displayName ourselves, since ESPN's own abbreviation handles
+            edge cases (suffixes, multi-word names) more reliably than
+            a naive "first letter + rest" split would.
+
+            Falls back to a couple of alternate shapes in case ESPN
+            changes this for other games/situations, and returns
+            (full_name, short_name) with either possibly None rather
+            than crashing if the structure is missing entirely."""
             candidates = [
-                lambda s: s.get("batter", {}).get("athlete", {}).get("displayName"),
-                lambda s: s.get("batter", {}).get("athlete", {}).get("fullName"),
-                lambda s: s.get("batter", {}).get("displayName"),
-                lambda s: s.get("atBat", {}).get("athlete", {}).get("displayName"),
-                lambda s: s.get("atBat", {}).get("displayName"),
+                lambda s: s.get("batter", {}).get("athlete", {}),
+                lambda s: s.get("atBat", {}).get("athlete", {}),
             ]
             for getter in candidates:
                 try:
-                    name = getter(situation_dict)
-                    if name:
-                        return name
+                    athlete = getter(situation_dict)
+                    full = athlete.get("displayName") or athlete.get("fullName")
+                    short = athlete.get("shortName")
+                    if full or short:
+                        return full, short
                 except Exception:
                     continue
-            return None
+            return None, None
+
+        batter_full, batter_short = extract_batter_info(situation)
 
         return {
             "state": status_type.get("state", "pre"),
@@ -668,7 +716,8 @@ class TidbytBaseballPlugin(BasePlugin):
             "balls": situation.get("balls", 0),
             "strikes": situation.get("strikes", 0),
             "outs": situation.get("outs", 0),
-            "batter_name": extract_batter_name(situation),
+            "batter_name": batter_full,
+            "batter_short_name": batter_short,
             "on_first": bool(situation.get("onFirst")),
             "on_second": bool(situation.get("onSecond")),
             "on_third": bool(situation.get("onThird")),
@@ -693,6 +742,7 @@ class TidbytBaseballPlugin(BasePlugin):
             "strikes": 1,
             "outs": 1,
             "batter_name": "Riley Greene",
+            "batter_short_name": "R. Greene",
             "on_first": True,
             "on_second": False,
             "on_third": True,
@@ -788,53 +838,64 @@ class TidbytBaseballPlugin(BasePlugin):
         left_w = width // 2
         col_w = left_w // 2
 
-        draw.rectangle([0, 0, col_w - 1, height - 1], fill=game["away_color"])
-        draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=game["home_color"])
+        try:
+            draw.rectangle([0, 0, col_w - 1, height - 1], fill=game["away_color"])
+            draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=game["home_color"])
 
-        away_txt_color = self._text_color_for(game["away_color"])
-        home_txt_color = self._text_color_for(game["home_color"])
+            away_txt_color = self._text_color_for(game["away_color"])
+            home_txt_color = self._text_color_for(game["home_color"])
 
-        # Both columns must render at the SAME font size, or a team with
-        # a longer score (e.g. "DET 12" vs "ATH 2") would shrink more to
-        # fit and visibly look smaller than the other -- that's the bug
-        # that made one team's text look bigger than the other's.
-        away_text = f"{game['away_abbr']} {game['away_score']}"
-        home_text = f"{game['home_abbr']} {game['home_score']}"
-        available_text_width = col_w - 4
-        shared_font = self._fit_font_for_pair(draw, away_text, home_text, available_text_width, start_size=10)
+            # Both columns must render at the SAME font size, or a team with
+            # a longer score (e.g. "DET 12" vs "ATH 2") would shrink more to
+            # fit and visibly look smaller than the other -- that's the bug
+            # that made one team's text look bigger than the other's.
+            away_text = f"{game['away_abbr']} {game['away_score']}"
+            home_text = f"{game['home_abbr']} {game['home_score']}"
+            available_text_width = col_w - 4
+            shared_font = self._fit_font_for_pair(draw, away_text, home_text, available_text_width, start_size=10)
 
-        self._draw_team_column(image, draw, 0, 0, col_w, height,
-                                game["away_abbr"], game["away_score"], game.get("away_logo"),
-                                away_txt_color, game["away_color"], shared_font)
-        self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
-                                game["home_abbr"], game["home_score"], game.get("home_logo"),
-                                home_txt_color, game["home_color"], shared_font)
+            self._draw_team_column(image, draw, 0, 0, col_w, height,
+                                    game["away_abbr"], game["away_score"], game.get("away_logo"),
+                                    away_txt_color, game["away_color"], shared_font)
+            self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
+                                    game["home_abbr"], game["home_score"], game.get("home_logo"),
+                                    home_txt_color, game["home_color"], shared_font)
 
-        right_x0 = left_w + 2
-        right_w = width - right_x0 - 1
+            right_x0 = left_w + 2
+            right_w = width - right_x0 - 1
 
-        top_margin = 2  # keeps inning triangle/number and outs off the physical top edge
-        self._draw_inning(image, right_x0 + 1, top_margin, game)
-        self._draw_outs(draw, right_x0, top_margin, right_w, game)
+            top_margin = 2  # keeps inning triangle/number and outs off the physical top edge
+            self._draw_inning(image, right_x0 + 1, top_margin, game)
+            self._draw_outs(draw, right_x0, top_margin, right_w, game)
 
-        inning_tri_size = 6
-        top_row_bottom = top_margin + inning_tri_size
-        lower_y = height - 6  # bottom-row text measures ~5px tall, so this is measured, not padded
-        diamond_y = top_row_bottom
-        diamond_available_h = (lower_y - 2) - diamond_y  # leave a clear gap before the bottom row
-        diamond_w = int(right_w * 0.5)
-        diamond_x = right_x0 + (right_w - diamond_w) // 2
-        self._draw_diamond(draw, diamond_x, diamond_y, diamond_w, diamond_available_h, game)
+            inning_tri_size = 6
+            top_row_bottom = top_margin + inning_tri_size
+            lower_y = height - 6  # bottom-row text measures ~5px tall, so this is measured, not padded
+            diamond_y = top_row_bottom
+            diamond_available_h = (lower_y - 2) - diamond_y  # leave a clear gap before the bottom row
+            diamond_w = int(right_w * 0.5)
+            diamond_x = right_x0 + (right_w - diamond_w) // 2
+            self._draw_diamond(draw, diamond_x, diamond_y, diamond_w, diamond_available_h, game)
 
-        count_text = f"{game['balls']}-{game['strikes']}"
-        self._draw_count(image, right_x0 + 1, lower_y, game)
+            count_text = f"{game['balls']}-{game['strikes']}"
+            self._draw_count(image, right_x0 + 1, lower_y, game)
 
-        if self.show_batter_name:
-            count_bbox = self._measure(self.font_count, count_text)
-            count_w = count_bbox[2] - count_bbox[0]
-            batter_x = right_x0 + 1 + count_w + 4
-            batter_max_w = (right_x0 + right_w) - batter_x
-            self._draw_batter(image, draw, batter_x, lower_y, batter_max_w, game.get("batter_name"))
+            if self.show_batter_name:
+                count_bbox = self._measure(self.font_count, count_text)
+                count_w = count_bbox[2] - count_bbox[0]
+                batter_x = right_x0 + 1 + count_w + 4
+                batter_max_w = (right_x0 + right_w) - batter_x
+                self._draw_batter(image, draw, batter_x, lower_y, batter_max_w, game.get("batter_name"), game.get("batter_short_name"))
+        except Exception as e:
+            # Same reasoning as the try/except added around update()'s
+            # parsing: a rendering bug triggered by one unusual game
+            # state (e.g. a field temporarily missing mid-play) should
+            # degrade to a blank/simple frame, not propagate an
+            # exception out of display() -- which could have the same
+            # "everything freezes" effect this whole investigation started from.
+            self.logger.error(f"Error rendering game display, showing blank frame instead: {e}", exc_info=True)
+            image = Image.new("RGB", (width, height), (0, 0, 0))
+            self._render_text(image, (4, height // 2 - 4), "Render Err", self.font_small, (200, 60, 60))
 
         self._push_image(image, force_clear)
 
@@ -1003,20 +1064,47 @@ class TidbytBaseballPlugin(BasePlugin):
         count_text = f"{game['balls']}-{game['strikes']}"
         self._render_text(image, (x, y), count_text, self.font_count, (255, 200, 0))
 
-    def _draw_batter(self, image, draw, x, y, max_width, batter_name):
-        """Draws 'F. Lastname' for whoever is currently at bat, shrunk
-        to fit whatever width remains next to the count. Skips silently
-        (no placeholder text) if ESPN didn't provide a batter name --
-        see the comment in _parse_game.extract_batter_name for how to
-        fix that if it turns out ESPN's field is named something else."""
-        if not batter_name or max_width <= 0:
+    def _draw_batter(self, image, draw, x, y, max_width, batter_name, batter_short_name=None):
+        """Draws whoever is currently at bat, shrunk to fit whatever
+        width remains next to the count.
+
+        Prefers ESPN's own pre-formatted `shortName` field (e.g.
+        "K. McGonigle") over reformatting `displayName` ourselves --
+        confirmed via real live-game data that ESPN already provides
+        this, and it's more reliable for edge cases (suffixes,
+        multi-word names) than a naive "first letter + rest" split.
+        Falls back to our own `_format_batter_name` if shortName wasn't
+        available for some reason.
+
+        If the name doesn't fit even at the smallest allowed font size
+        (confirmed with real ESPN data: "Kevin McGonigle" -> "K. McGonigle"
+        is 12 characters, wider than the ~44px available even at the
+        floor size), truncate character-by-character with a trailing
+        "." rather than silently drawing nothing. The old version's
+        safety check against overflow had the side effect of hiding the
+        batter name entirely for any name too long to fully fit -- which
+        in practice was most real player names, not an edge case."""
+        if (not batter_name and not batter_short_name) or max_width <= 0:
             return
-        formatted = self._format_batter_name(batter_name)
+        formatted = batter_short_name or self._format_batter_name(batter_name)
         font = self._fit_font_for_width(draw, formatted, max_width, start_size=7, min_size=4)
         bbox = self._measure(font, formatted)
+
+        text_to_draw = formatted
         if bbox[2] - bbox[0] > max_width:
-            return  # still doesn't fit even at the smallest size -- skip rather than overflow
-        self._render_text(image, (x, y), formatted, font, (200, 200, 200))
+            truncated = formatted
+            text_to_draw = None
+            while truncated:
+                candidate = truncated + "."
+                cbbox = self._measure(font, candidate)
+                if cbbox[2] - cbbox[0] <= max_width:
+                    text_to_draw = candidate
+                    break
+                truncated = truncated[:-1]
+            if text_to_draw is None:
+                return  # nothing fits, not even a single truncated character
+
+        self._render_text(image, (x, y), text_to_draw, font, (200, 200, 200))
 
     def _draw_outs(self, draw, x, y, w, game):
         square = 3

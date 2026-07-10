@@ -209,7 +209,117 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
-## Critical fix: oversized/overflowing team text
+## Fixed: everything freezing after the first successful update
+
+Since you confirmed the **score** was frozen too (not just balls/
+strikes/batter), that ruled out a narrow bug in one specific field and
+pointed at something systemic: **an unhandled exception silently
+killing all future updates after the first successful one.**
+
+Both `update()` and `display()` had this same structural gap: only the
+network request itself was wrapped in try/except. Anything that threw
+*after* that -- parsing an unusual game state (extra innings, a
+pitching change, a field that's temporarily null mid-play, etc.) --
+would propagate straight out uncaught. If the core scheduler's plugin
+loop doesn't itself guard against a plugin's `update()`/`display()`
+throwing, one bad response at any point during a 3+ hour game could
+permanently stop this plugin from ever refreshing again -- exactly
+matching "shows latest info after restart, then nothing" (the restart
+re-runs `__init__`, which works fine off a fresh state; it's some
+*later* poll during the live game that likely hit the unhandled
+exception).
+
+**Fixed**: both `update()`'s parsing/processing and `display()`'s
+rendering are now wrapped in their own broad exception handlers.
+`update()` keeps the last-known-good game data and logs a full
+traceback instead of losing everything; `display()` falls back to a
+simple error frame instead of crashing. I verified this concretely
+(not just by inspection): simulated a parsing exception mid-update and
+confirmed `update()` survives it, preserves the previous data, logs
+the full traceback, and `display()` continues working normally
+afterward.
+
+**If this was in fact the bug**, the traceback that gets logged next
+time it happens will tell us exactly which game state triggered it --
+please share it if you see the new `ERROR: Fetched scoreboard
+successfully but failed to parse/process it: ...` line in your logs,
+and I can add explicit handling for whatever specific case it turns
+out to be.
+
+## Diagnosing: live data seems to stop updating after restart
+
+Two different things could cause this, and they need different fixes,
+so `update()` now logs enough to tell them apart:
+
+**Hypothesis A: the core LEDMatrix scheduler isn't calling `update()`
+often enough.** This plugin's own polling logic (`live_update_interval_seconds`)
+only works if the core actually calls `update()` at least that often.
+If the scheduler only calls it when this plugin's rotation slot comes
+up on screen (not continuously in the background while other plugins
+are showing), the data would only ever refresh once per rotation cycle
+-- which could be much slower than 15s if there are several plugins in
+rotation. This is outside this plugin's control if it's what's
+happening.
+
+**Hypothesis B: `update()` is being called on schedule, but the fetch
+itself is silently failing every time** (network hiccup, ESPN rate
+limiting, etc.) after the first successful one at startup.
+
+**What the new logging shows:**
+```
+DEBUG: update() called but skipping fetch -- only 3.2s since last fetch (interval is 15s)...
+INFO: Fetched scoreboard OK: 1 live game(s). First: ATH@DET 3-2, count 2-1, outs 1, batter=K. McGonigle
+```
+or, if the fetch is failing:
+```
+ERROR: Failed to fetch MLB scoreboard: <error details>
+```
+
+**What to check**: during a live game, watch the logs for a minute or
+two (past the first update). If you see repeated `Fetched scoreboard OK`
+lines with the count/batter actually changing between them, the fetch
+logic is fine and it's Hypothesis A (a core-scheduler question, not
+something in this plugin). If you see `ERROR: Failed to fetch...`
+repeating, that's Hypothesis B and tells us exactly what's failing. If
+you see neither -- no log lines from this plugin at all after the
+first one -- that's the strongest sign of Hypothesis A: `update()`
+simply isn't being invoked again.
+
+One more useful data point: does the **score** (not just balls/strikes/
+batter) also stay frozen after the first update, or does it change
+correctly while only balls/strikes/batter/count seem stuck? If score
+updates fine but those three don't, that points to something more
+specific worth digging into rather than a general polling problem.
+
+
+
+Confirmed against real live-game data you pulled (ATH@DET and SEA@MIA,
+2026-07-09) that ESPN's actual field structure is
+`situation.batter.athlete.{displayName, fullName, shortName}` --
+extraction itself was working correctly and pulling the right name.
+
+**The actual bug was downstream**: `_draw_batter` had a safety check
+that silently skipped drawing entirely if the formatted name didn't
+fit even at the smallest allowed font size. Tested with real data:
+"Kevin McGonigle" -> "K. McGonigle" measures 48px wide at the floor
+size, but only ~44px of space is available next to the count. That's
+not a rare edge case -- most real player names are long enough to hit
+this, which is why it looked like the feature was completely broken
+rather than just failing for a couple of long names.
+
+**Fixed**: instead of skipping, it now truncates character-by-character
+(adding a trailing ".") until something fits, so you always see as
+much of the name as there's room for rather than nothing at all.
+Verified against "K. McGonigle", "V. Guerrero Jr.", and "R. Acuna Jr." --
+all now render.
+
+**Also improved**: now prefers ESPN's own pre-formatted `shortName`
+field (e.g. "K. McGonigle") instead of reformatting `displayName`
+ourselves -- more reliable for suffixes and multi-word names than a
+naive "first letter + rest" split, and it's real data ESPN already
+provides.
+
+
 
 **This was a real bug I introduced with the BDF support, not a tuning
 issue.** `_fit_font_for_width`/`_fit_font_for_pair` were checking
