@@ -1536,7 +1536,7 @@ class TidbytBaseballPlugin(BasePlugin):
                                     game["home_abbr"], game["home_score"], game.get("home_logo"),
                                     home_txt_color, game["home_color"], shared_font)
 
-            draw.rectangle([left_w, 0, left_w + 1, height - 1], fill=(255, 255, 255))
+            draw.rectangle([left_w, 0, left_w, height - 1], fill=(166, 166, 166))
 
             right_x0 = left_w + 2
             right_w = width - right_x0 - 1
@@ -1693,7 +1693,7 @@ class TidbytBaseballPlugin(BasePlugin):
                                 home_txt_color, game["home_color"], shared_font,
                                 bar_color_override=yellow if home_won else None)
 
-        draw.rectangle([left_w, 0, left_w + 1, height - 1], fill=(255, 255, 255))
+        draw.rectangle([left_w, 0, left_w, height - 1], fill=(166, 166, 166))
 
         right_x0 = left_w + 2
         right_w = width - right_x0 - 1
@@ -1729,7 +1729,7 @@ class TidbytBaseballPlugin(BasePlugin):
                                 game["home_abbr"], game["home_score"], game.get("home_logo"),
                                 home_txt_color, game["home_color"], shared_font, show_score=False)
 
-        draw.rectangle([left_w, 0, left_w + 1, height - 1], fill=(255, 255, 255))
+        draw.rectangle([left_w, 0, left_w, height - 1], fill=(166, 166, 166))
 
         right_x0 = left_w + 2
         right_w = width - right_x0 - 1

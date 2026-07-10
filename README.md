@@ -247,13 +247,22 @@ confirmed the slower refresh timer actually holds -- ran two immediate
 back-to-back refreshes and verified the lookahead only fired once, not
 twice.
 
-## New: white separator bar
+## Separator bar: now 1px gray, and fixed the "N looks like M" issue
 
-A 2px solid white vertical bar now sits between the team-color half
-and the black half, on all three game types (live, final, upcoming).
-Verified by sampling every pixel down that column across all three
-render paths -- confirmed solid white top to bottom in each case, not
-just visually similar.
+- **Separator bar**: changed from 2px white to 1px, color `(166, 166, 166)`,
+  on all three game types. Verified by sampling the exact pixel column --
+  confirmed it's a single column wide and precisely that gray, with
+  neighboring columns unaffected.
+- **The "N" glyph really did look like "M"** -- confirmed this by
+  decoding the actual bitmap data straight from the font file rather
+  than guessing: at only 3 pixels wide, tom_thumb's "N" used three
+  solid middle rows, differing from "M" by exactly one row --
+  genuinely ambiguous, not a rendering bug. Since this plugin bundles
+  its own copy of the font file specifically for itself, patched just
+  that one glyph to a zigzag diagonal pattern that's clearly distinct
+  from M, H, X, W, and every other letter checked. Verified the new
+  glyph renders pixel-for-pixel as intended through the actual BDF
+  parser, not just that the source file looks right.
 
 ## Favorite-team priority cascade
 
