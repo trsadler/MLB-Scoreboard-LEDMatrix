@@ -258,14 +258,22 @@ twice.
   than guessing: at only 3 pixels wide, tom_thumb's "N" originally used
   three solid middle rows, differing from "M" by exactly one row --
   genuinely ambiguous, not a rendering bug. Iterated through several
-  designs (zigzag diagonal, dot shifted one row up, a handful of other
-  diagonal/crossbar variations, dot at dead-center matching "H")
-  before landing on the final choice: verticals fully lit with the
-  single dot shifted one row BELOW center -- distinct from both "H"
-  (dot at dead-center) and every other letter/digit (checked all of
-  them at each iteration). Verified pixel-for-pixel through the actual
-  BDF parser at every step, not just that the source file's bytes look
-  right.
+  3px-wide designs (zigzag diagonal, dot at various rows) before
+  settling on a real diagonal instead: **N is now 4px wide with an
+  actual 2-step staircase stroke**, up from the 3px every other letter
+  uses. Confirmed via code inspection that this font's renderer already
+  advances the cursor using each glyph's own `DWIDTH` value (not a
+  fixed column width), so N's advance was bumped to 5 (instead of the
+  usual 4) to preserve the 1px gap before the next letter -- verified
+  this holds by directly measuring N's rendered width (5px, as
+  intended) and by stress-testing real team abbreviations containing N
+  ("MIN", "CIN") to confirm they still fit the column width comfortably
+  even with N's extra pixel. The trade-off: N now takes up marginally
+  more horizontal space than other letters, so a word containing N
+  isn't quite as tightly uniform-width as one without -- judged an
+  acceptable cost for a diagonal that actually reads as a diagonal.
+  Verified pixel-for-pixel through the actual BDF parser at every
+  design iteration, not just that the source file's bytes look right.
 
 ## Favorite-team priority cascade
 
