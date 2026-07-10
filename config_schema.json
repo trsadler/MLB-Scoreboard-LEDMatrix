@@ -189,6 +189,18 @@
       "type": "boolean",
       "default": false,
       "description": "Only relevant when show_favorite_teams_only is off. When no favorite team is live, this controls whether past/upcoming games expand to include all teams (true) or stay scoped to favorite teams only (false, default). Ignored (always favorites-only) when show_favorite_teams_only is on."
+    },
+    "upcoming_games_lookahead_days": {
+      "type": "integer",
+      "default": 5,
+      "minimum": 1,
+      "description": "How many days ahead to explicitly check for upcoming favorite-team games. ESPN's scoreboard endpoint only returns TODAY's games by default, so this queries additional future days individually (one extra request per day) to actually find a team's next scheduled game."
+    },
+    "upcoming_games_refresh_seconds": {
+      "type": "integer",
+      "default": 1800,
+      "minimum": 60,
+      "description": "How often to re-run the future-days lookahead (separate from the main scoreboard poll interval, since schedules barely change within a day -- no need to re-check every 15 seconds during a live game)."
     }
   },
   "required": [

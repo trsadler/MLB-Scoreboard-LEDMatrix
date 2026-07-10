@@ -243,6 +243,16 @@ class TidbytBaseballPlugin(BasePlugin):
         self.past_games: List[Dict[str, Any]] = []
         self.upcoming_games: List[Dict[str, Any]] = []
         self.rotation_games: List[Dict[str, Any]] = []  # what _current_game()/_maybe_rotate() actually cycle through
+
+        # ESPN's scoreboard endpoint defaults to TODAY's games only with
+        # no date parameter -- a favorite team's actual next game is
+        # almost always tomorrow or later (not today), so relying on the
+        # main scoreboard fetch alone means upcoming_games is nearly
+        # always empty. This cache holds results from explicitly querying
+        # the next few days (see _fetch_future_upcoming_games), refreshed
+        # on its own slower timer since schedules barely change.
+        self._cached_future_upcoming_games: List[Dict[str, Any]] = []
+        self._upcoming_last_fetch_time: float = 0.0
         self.fallback_game: Optional[Dict[str, Any]] = None
         self.current_index: int = 0
         self.last_switch_time: float = time.time()
@@ -398,6 +408,8 @@ class TidbytBaseballPlugin(BasePlugin):
         self.max_past_games = cfg.get("max_past_games", 3)
         self.max_upcoming_games = cfg.get("max_upcoming_games", 3)
         self.past_upcoming_all_teams = cfg.get("past_upcoming_all_teams", False)
+        self.upcoming_games_lookahead_days = cfg.get("upcoming_games_lookahead_days", 5)
+        self.upcoming_games_refresh_seconds = cfg.get("upcoming_games_refresh_seconds", 1800)
         self.test_mode = cfg.get("test_mode", False)
 
     def on_config_change(self, new_config):
@@ -748,6 +760,26 @@ class TidbytBaseballPlugin(BasePlugin):
         try:
             live_games, past_games, upcoming_games, fallback_game = self._process_scoreboard(data)
 
+            # ESPN's main scoreboard call only covers today -- merge in
+            # the separately-cached multi-day lookahead so upcoming_games
+            # isn't nearly always empty (see _fetch_future_upcoming_games
+            # for why). Only re-queries the future days on its own slower
+            # timer, since schedules barely change within a day.
+            now_ts = time.time()
+            if self.show_upcoming_games and (now_ts - self._upcoming_last_fetch_time >= self.upcoming_games_refresh_seconds):
+                try:
+                    self._cached_future_upcoming_games = self._fetch_future_upcoming_games()
+                    self._upcoming_last_fetch_time = now_ts
+                except Exception as e:
+                    self.logger.warning(f"Upcoming-games lookahead failed, keeping previous cache: {e}")
+
+            if self.show_upcoming_games:
+                combined_upcoming = {g["event_id"]: g for g in upcoming_games}
+                for g in self._cached_future_upcoming_games:
+                    combined_upcoming.setdefault(g["event_id"], g)
+                upcoming_games = sorted(combined_upcoming.values(), key=lambda g: g.get("event_date_raw") or "")
+                upcoming_games = upcoming_games[: self.max_upcoming_games]
+
             for g in live_games + past_games + upcoming_games:
                 self._resolve_logos(g)
             if fallback_game:
@@ -1047,6 +1079,53 @@ class TidbytBaseballPlugin(BasePlugin):
             return None
 
         return scan(data)
+
+    def _fetch_future_upcoming_games(self) -> List[Dict[str, Any]]:
+        """Explicitly queries ESPN's scoreboard for each of the next
+        `upcoming_games_lookahead_days` days (via the `dates=YYYYMMDD`
+        parameter), since the default no-date-parameter call only
+        returns TODAY's games -- a favorite team's actual next game is
+        almost always tomorrow or later, not today, so relying on the
+        main scoreboard fetch alone means upcoming_games is nearly
+        always empty. This is a separate, slower-cadence fetch (see
+        upcoming_games_refresh_seconds) since schedules barely change
+        within a day, unlike scores/situations which need frequent
+        polling. One request per day queried; failures on individual
+        days are logged and skipped rather than aborting the whole
+        lookahead."""
+        if not self.show_upcoming_games:
+            return []
+
+        favorites_only = self.show_favorite_teams_only or not self.past_upcoming_all_teams
+        results = []
+        today = datetime.datetime.now()
+
+        for offset in range(1, self.upcoming_games_lookahead_days + 1):
+            day = today + datetime.timedelta(days=offset)
+            date_param = day.strftime("%Y%m%d")
+            try:
+                resp = self.session.get(ESPN_SCOREBOARD_URL, params={"dates": date_param}, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                self.logger.warning(f"Could not fetch upcoming-games lookahead for {date_param}: {e}")
+                continue
+
+            for event in data.get("events", []):
+                competitions = event.get("competitions", [])
+                if not competitions:
+                    continue
+                comp = competitions[0]
+                state = comp.get("status", {}).get("type", {}).get("state")
+                if state != "pre":
+                    continue
+                competitors = comp.get("competitors", [])
+                abbrevs = [c.get("team", {}).get("abbreviation", "").upper() for c in competitors]
+                involves_favorite = any(fav in abbrevs for fav in self.favorite_teams)
+                if involves_favorite or not favorites_only:
+                    results.append(self._parse_game(event, comp, game_type="upcoming"))
+
+        return results
 
     def _process_scoreboard(self, data: Dict[str, Any]):
         events = data.get("events", [])
@@ -1457,6 +1536,8 @@ class TidbytBaseballPlugin(BasePlugin):
                                     game["home_abbr"], game["home_score"], game.get("home_logo"),
                                     home_txt_color, game["home_color"], shared_font)
 
+            draw.rectangle([left_w, 0, left_w + 1, height - 1], fill=(255, 255, 255))
+
             right_x0 = left_w + 2
             right_w = width - right_x0 - 1
 
@@ -1612,6 +1693,8 @@ class TidbytBaseballPlugin(BasePlugin):
                                 home_txt_color, game["home_color"], shared_font,
                                 bar_color_override=yellow if home_won else None)
 
+        draw.rectangle([left_w, 0, left_w + 1, height - 1], fill=(255, 255, 255))
+
         right_x0 = left_w + 2
         right_w = width - right_x0 - 1
         font = self._load_font(10, bold=True)
@@ -1645,6 +1728,8 @@ class TidbytBaseballPlugin(BasePlugin):
         self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
                                 game["home_abbr"], game["home_score"], game.get("home_logo"),
                                 home_txt_color, game["home_color"], shared_font, show_score=False)
+
+        draw.rectangle([left_w, 0, left_w + 1, height - 1], fill=(255, 255, 255))
 
         right_x0 = left_w + 2
         right_w = width - right_x0 - 1

@@ -216,6 +216,45 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: upcoming games never actually showing up
+
+**Root cause**: ESPN's scoreboard endpoint returns only TODAY's games
+when called with no date parameter -- which is what this plugin was
+doing. A favorite team's actual next game is almost always tomorrow or
+later, not today, so `upcoming_games` was nearly always empty; only a
+same-day doubleheader's second game would ever show up. Meanwhile
+`past_games` worked fine, since a team that already played today shows
+up as "post" state in that same fetch -- which is exactly why it
+looked like only final scores were ever cycling.
+
+**Fixed**: added `_fetch_future_upcoming_games()`, which explicitly
+queries ESPN's scoreboard for each of the next
+`upcoming_games_lookahead_days` days (default 5) using the
+`dates=YYYYMMDD` parameter, merges those results with whatever
+same-day upcoming games the main fetch found, dedupes by event ID,
+and sorts by actual start time. This runs on its own slower timer
+(`upcoming_games_refresh_seconds`, default 1800s/30min) rather than
+the normal live-polling cadence, since schedules don't change from one
+15-second poll to the next -- no reason to re-issue several extra
+requests that often.
+
+Verified end-to-end through the real code path, not just by re-reading
+the logic: simulated a scenario where today's fetch only contains a
+completed game and a future day's fetch (queried via the `dates`
+parameter) contains the actual next scheduled game, and confirmed it
+now correctly appears in rotation alongside the final score. Also
+confirmed the slower refresh timer actually holds -- ran two immediate
+back-to-back refreshes and verified the lookahead only fired once, not
+twice.
+
+## New: white separator bar
+
+A 2px solid white vertical bar now sits between the team-color half
+and the black half, on all three game types (live, final, upcoming).
+Verified by sampling every pixel down that column across all three
+render paths -- confirmed solid white top to bottom in each case, not
+just visually similar.
+
 ## Favorite-team priority cascade
 
 Reworked how `favorite_teams` interacts with rotation, since the old
