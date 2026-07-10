@@ -216,6 +216,35 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: past games stopped showing up
+
+**Same root cause, opposite direction**: this is the mirror image of
+the upcoming-games bug -- the main scoreboard call still only returns
+TODAY's games, and `past_games` was built exclusively from that
+single-day fetch's "post"-state entries. So a favorite team's most
+recent completed game only ever showed up if it happened to be
+*today*. On an off-day, or before today's game finishes, that most
+recent finished game was often yesterday or earlier -- which simply
+never appeared, exactly matching "past games stopped working."
+
+**Fixed the same way**: added `_fetch_past_games_lookback()`, which
+explicitly queries the previous `past_games_lookback_days` days
+(default 3) via the `dates=YYYYMMDD` parameter, merges those with
+whatever same-day past games the main fetch found, dedupes by event
+ID, and sorts most-recent-first (reverse chronological -- unlike
+upcoming games, which sort soonest-first). Same slower refresh
+cadence as the upcoming lookahead (`past_games_refresh_seconds`,
+default 1800s), since completed games obviously don't change.
+
+Verified end-to-end through the real code path: simulated a scenario
+where today has no game at all for the favorite team (an off-day) but
+a lookback day has their actual last completed game, and confirmed it
+now correctly appears in `past_games` and rotation. Also confirmed the
+slower refresh timer holds on repeated immediate calls, same as the
+upcoming-games fix.
+
+
+
 ## Fixed: upcoming games never actually showing up
 
 **Root cause**: ESPN's scoreboard endpoint returns only TODAY's games

@@ -253,6 +253,14 @@ class TidbytBaseballPlugin(BasePlugin):
         # on its own slower timer since schedules barely change.
         self._cached_future_upcoming_games: List[Dict[str, Any]] = []
         self._upcoming_last_fetch_time: float = 0.0
+
+        # Same issue, opposite direction: ESPN's main scoreboard call
+        # only covers TODAY, so a favorite team's most recent completed
+        # game (if it was yesterday or earlier -- an off-day today, or
+        # today's game hasn't finished) never shows up as a past game
+        # without explicitly looking backward too.
+        self._cached_past_lookback_games: List[Dict[str, Any]] = []
+        self._past_last_fetch_time: float = 0.0
         self.fallback_game: Optional[Dict[str, Any]] = None
         self.current_index: int = 0
         self.last_switch_time: float = time.time()
@@ -410,6 +418,8 @@ class TidbytBaseballPlugin(BasePlugin):
         self.past_upcoming_all_teams = cfg.get("past_upcoming_all_teams", False)
         self.upcoming_games_lookahead_days = cfg.get("upcoming_games_lookahead_days", 5)
         self.upcoming_games_refresh_seconds = cfg.get("upcoming_games_refresh_seconds", 1800)
+        self.past_games_lookback_days = cfg.get("past_games_lookback_days", 3)
+        self.past_games_refresh_seconds = cfg.get("past_games_refresh_seconds", 1800)
         self.test_mode = cfg.get("test_mode", False)
 
     def on_config_change(self, new_config):
@@ -780,6 +790,26 @@ class TidbytBaseballPlugin(BasePlugin):
                 upcoming_games = sorted(combined_upcoming.values(), key=lambda g: g.get("event_date_raw") or "")
                 upcoming_games = upcoming_games[: self.max_upcoming_games]
 
+            # Mirror image of the upcoming-games fix: ESPN's main call
+            # only covers today, so a favorite team's most recent
+            # completed game (yesterday or earlier) never shows up
+            # without explicitly looking backward too.
+            if self.show_past_games and (now_ts - self._past_last_fetch_time >= self.past_games_refresh_seconds):
+                try:
+                    self._cached_past_lookback_games = self._fetch_past_games_lookback()
+                    self._past_last_fetch_time = now_ts
+                except Exception as e:
+                    self.logger.warning(f"Past-games lookback failed, keeping previous cache: {e}")
+
+            if self.show_past_games:
+                combined_past = {g["event_id"]: g for g in past_games}
+                for g in self._cached_past_lookback_games:
+                    combined_past.setdefault(g["event_id"], g)
+                # Most recent first -- reverse chronological, unlike
+                # upcoming games which sort soonest-first.
+                past_games = sorted(combined_past.values(), key=lambda g: g.get("event_date_raw") or "", reverse=True)
+                past_games = past_games[: self.max_past_games]
+
             for g in live_games + past_games + upcoming_games:
                 self._resolve_logos(g)
             if fallback_game:
@@ -1079,6 +1109,50 @@ class TidbytBaseballPlugin(BasePlugin):
             return None
 
         return scan(data)
+
+    def _fetch_past_games_lookback(self) -> List[Dict[str, Any]]:
+        """Explicitly queries ESPN's scoreboard for each of the previous
+        `past_games_lookback_days` days (via the `dates=YYYYMMDD`
+        parameter) -- the mirror image of _fetch_future_upcoming_games's
+        problem: the default no-date-parameter call only returns TODAY's
+        games, so a favorite team's most recent COMPLETED game never
+        shows up as a past game if it happened yesterday or earlier
+        (an off-day today, or today's game hasn't finished yet). Same
+        slower-cadence caching rationale as the upcoming lookahead --
+        see past_games_refresh_seconds."""
+        if not self.show_past_games:
+            return []
+
+        favorites_only = self.show_favorite_teams_only or not self.past_upcoming_all_teams
+        results = []
+        today = datetime.datetime.now()
+
+        for offset in range(1, self.past_games_lookback_days + 1):
+            day = today - datetime.timedelta(days=offset)
+            date_param = day.strftime("%Y%m%d")
+            try:
+                resp = self.session.get(ESPN_SCOREBOARD_URL, params={"dates": date_param}, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                self.logger.warning(f"Could not fetch past-games lookback for {date_param}: {e}")
+                continue
+
+            for event in data.get("events", []):
+                competitions = event.get("competitions", [])
+                if not competitions:
+                    continue
+                comp = competitions[0]
+                state = comp.get("status", {}).get("type", {}).get("state")
+                if state != "post":
+                    continue
+                competitors = comp.get("competitors", [])
+                abbrevs = [c.get("team", {}).get("abbreviation", "").upper() for c in competitors]
+                involves_favorite = any(fav in abbrevs for fav in self.favorite_teams)
+                if involves_favorite or not favorites_only:
+                    results.append(self._parse_game(event, comp, game_type="final"))
+
+        return results
 
     def _fetch_future_upcoming_games(self) -> List[Dict[str, Any]]:
         """Explicitly queries ESPN's scoreboard for each of the next

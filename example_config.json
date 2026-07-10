@@ -27,6 +27,8 @@
     "past_upcoming_all_teams": false,
     "upcoming_games_lookahead_days": 5,
     "upcoming_games_refresh_seconds": 1800,
+    "past_games_lookback_days": 3,
+    "past_games_refresh_seconds": 1800,
     "test_mode": false
   }
 }

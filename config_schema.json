@@ -201,6 +201,18 @@
       "default": 1800,
       "minimum": 60,
       "description": "How often to re-run the future-days lookahead (separate from the main scoreboard poll interval, since schedules barely change within a day -- no need to re-check every 15 seconds during a live game)."
+    },
+    "past_games_lookback_days": {
+      "type": "integer",
+      "default": 3,
+      "minimum": 1,
+      "description": "How many days back to explicitly check for a favorite team's completed games. ESPN's scoreboard endpoint only returns TODAY's games by default, so this queries additional past days individually (one extra request per day) to actually find a team's most recent finished game if it wasn't today."
+    },
+    "past_games_refresh_seconds": {
+      "type": "integer",
+      "default": 1800,
+      "minimum": 60,
+      "description": "How often to re-run the past-days lookback (separate from the main scoreboard poll interval, since completed games don't change)."
     }
   },
   "required": [
