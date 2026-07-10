@@ -216,6 +216,47 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## New: traditional green box score for final games
+
+Kept the left-half team columns (logo/abbreviation/score, same as the
+live layout, winning team's bar still highlighted yellow) and confined
+the box score to the black half only, per follow-up request -- header
+row (inning numbers + R/H/E labels), then one row per team showing
+runs scored each inning plus final Runs/Hits/Errors, Fenway-green
+style. No team-abbreviation column in the grid itself, since the team
+names are already visible on the left; the box score's top row is
+away, bottom is home, matching the left half's top/bottom team columns.
+
+**Squeezed the team columns to make room**, per your explicit go-ahead:
+went from a 50/50 split to 40/60 (left/right). Verified this was
+actually necessary, not just assumed: at the original 50/50 split, box
+score cells came out to 5px wide, and cropping/inspecting an actual
+rendered digit at that size showed it bleeding right up against the
+cell border with no clearance. After the squeeze, cells are 6px, and
+the same check confirmed a full pixel of clearance from the border on
+both sides -- a real, measured improvement, not just "looks a little
+better."
+
+**Data confidence, same honest breakdown as everything else in this
+plugin**: per-inning `linescores` are a documented ESPN field
+(confirmed via independent community API documentation, not just
+assumed), so those should be reliable. Hits and errors are NOT
+confirmed the same way -- there's a generic `statistics` array
+documented but not confirmed specifically for baseball H/E, so those
+get backfilled from ESPN's detailed summary endpoint
+(`_enrich_boxscore_stats`) if missing from the lightweight scoreboard
+response, and simply show blank (not a misleading `0`) if even that
+doesn't find them. This only ever fetches once per completed game
+(tracked via `_enriched_boxscore_event_ids`) since a finished game's
+stats can't change -- verified this caching actually prevents a
+second fetch on a repeat call, not just that the fetch itself works.
+
+**Handles edge cases gracefully**: extra-innings games shown are
+capped based on how many actually fit at a legible minimum cell width
+(re-verified a 15-inning game still renders without crashing or
+overflowing after the layout change), and missing hits/errors show
+blank cells rather than crashing (re-verified after the squeeze too).
+
 ## Fixed: past games stopped showing up
 
 **Same root cause, opposite direction**: this is the mirror image of

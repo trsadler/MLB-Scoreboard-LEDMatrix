@@ -260,6 +260,12 @@ class TidbytBaseballPlugin(BasePlugin):
         # today's game hasn't finished) never shows up as a past game
         # without explicitly looking backward too.
         self._cached_past_lookback_games: List[Dict[str, Any]] = []
+
+        # Tracks which final games have already had their hits/errors
+        # enriched from the summary endpoint -- since a completed game's
+        # stats can't change, this ensures we only ever fetch it once
+        # per game rather than re-fetching every poll it stays in rotation.
+        self._enriched_boxscore_event_ids: set = set()
         self._past_last_fetch_time: float = 0.0
         self.fallback_game: Optional[Dict[str, Any]] = None
         self.current_index: int = 0
@@ -810,6 +816,12 @@ class TidbytBaseballPlugin(BasePlugin):
                 past_games = sorted(combined_past.values(), key=lambda g: g.get("event_date_raw") or "", reverse=True)
                 past_games = past_games[: self.max_past_games]
 
+                for g in past_games:
+                    try:
+                        self._enrich_boxscore_stats(g)
+                    except Exception as e:
+                        self.logger.warning(f"Could not fetch box score stats for {g['away_abbr']}@{g['home_abbr']}: {e}")
+
             for g in live_games + past_games + upcoming_games:
                 self._resolve_logos(g)
             if fallback_game:
@@ -991,6 +1003,67 @@ class TidbytBaseballPlugin(BasePlugin):
                 )
 
             return dict(self._active_flash) if self._active_flash else None
+
+    def _enrich_boxscore_stats(self, game: Dict[str, Any]):
+        """For FINAL games only: if hits/errors weren't in the main
+        scoreboard response (unconfirmed field, unlike linescores which
+        are documented), fetches ESPN's detailed summary endpoint to
+        fill them in. Only ever needs to run ONCE per completed game
+        (the data can't change after the fact), tracked via
+        _enriched_boxscore_event_ids so this doesn't re-fetch on every
+        poll for games already showing in past_games rotation.
+
+        Defensive in the same way as pitch count: tries a specific
+        plausible path (boxscore.teams[].statistics[]) first, and if
+        that doesn't find hits/errors, logs the raw structure at DEBUG
+        level so there's real data to fix this against instead of
+        guessing again."""
+        event_id = game.get("event_id")
+        if not event_id or event_id in self._enriched_boxscore_event_ids:
+            return
+        if game.get("away_hits") is not None and game.get("home_hits") is not None:
+            self._enriched_boxscore_event_ids.add(event_id)
+            return
+
+        resp = self.session.get(ESPN_SUMMARY_URL, params={"event": event_id}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        found_any = False
+        try:
+            for team_block in data.get("boxscore", {}).get("teams", []):
+                abbr = team_block.get("team", {}).get("abbreviation", "").upper()
+                stats = {}
+                for s in team_block.get("statistics", []):
+                    name = (s.get("name") or s.get("abbreviation") or "").lower()
+                    stats[name] = s.get("displayValue", s.get("value"))
+                hits = stats.get("hits") or stats.get("h")
+                errors = stats.get("errors") or stats.get("e")
+                if abbr == game.get("away_abbr"):
+                    if hits is not None:
+                        game["away_hits"] = hits
+                        found_any = True
+                    if errors is not None:
+                        game["away_errors"] = errors
+                        found_any = True
+                elif abbr == game.get("home_abbr"):
+                    if hits is not None:
+                        game["home_hits"] = hits
+                        found_any = True
+                    if errors is not None:
+                        game["home_errors"] = errors
+                        found_any = True
+        except Exception:
+            pass
+
+        if not found_any:
+            self.logger.debug(
+                f"Could not find hits/errors in the summary response for "
+                f"{game.get('away_abbr')}@{game.get('home_abbr')}. "
+                f"boxscore keys: {list(data.get('boxscore', {}).keys())}"
+            )
+
+        self._enriched_boxscore_event_ids.add(event_id)
 
     def _enrich_pitch_count(self, game: Dict[str, Any]):
         """Fetches ESPN's detailed per-game summary endpoint and tries
@@ -1320,6 +1393,39 @@ class TidbytBaseballPlugin(BasePlugin):
                 return logos[0].get("href")
             return None
 
+        def extract_linescores(competitor):
+            """Confirmed via independent ESPN API documentation
+            (community-maintained, not just my guess): each competitor
+            object has a 'linescores' array, one entry per inning,
+            each with a 'value' field for runs scored that inning, in
+            order. Returns [] rather than crashing if missing/malformed."""
+            try:
+                linescores = competitor.get("linescores", [])
+                return [int(ls.get("value", 0) or 0) for ls in linescores]
+            except Exception:
+                return []
+
+        def extract_hits_errors(competitor):
+            """UNLIKE linescores, hits/errors are NOT confirmed present
+            in this lightweight scoreboard response -- there's a
+            documented generic 'statistics' array, but not confirmed
+            specifically for baseball H/E. Tries a few plausible keys
+            here; returns (None, None) if not found, which signals the
+            caller to fetch the detailed summary endpoint instead
+            (see _enrich_boxscore_stats)."""
+            hits, errors = None, None
+            try:
+                for stat in competitor.get("statistics", []):
+                    name = (stat.get("name") or stat.get("abbreviation") or "").lower()
+                    val = stat.get("displayValue", stat.get("value"))
+                    if name in ("hits", "h"):
+                        hits = val
+                    elif name in ("errors", "e"):
+                        errors = val
+            except Exception:
+                pass
+            return hits, errors
+
         def extract_batter_info(situation_dict):
             """Confirmed against real live-game data (2026-07-09, ATH@DET
             and SEA@MIA): ESPN's actual structure is
@@ -1407,12 +1513,22 @@ class TidbytBaseballPlugin(BasePlugin):
         pitch_count = extract_pitch_count(situation)
         last_play_id, last_play_text, last_play_type = extract_last_play(situation)
         game_date_str, game_time_str = self._format_game_datetime(event)
+        away_linescores = extract_linescores(away)
+        home_linescores = extract_linescores(home)
+        away_hits, away_errors = extract_hits_errors(away)
+        home_hits, home_errors = extract_hits_errors(home)
 
         return {
             "game_type": game_type,
             "event_date_raw": event.get("date"),
             "game_date_str": game_date_str,
             "game_time_str": game_time_str,
+            "away_linescores": away_linescores,
+            "home_linescores": home_linescores,
+            "away_hits": away_hits,
+            "home_hits": home_hits,
+            "away_errors": away_errors,
+            "home_errors": home_errors,
             "state": status_type.get("state", "pre"),
             "away_abbr": away.get("team", {}).get("abbreviation", "AWY")[:3].upper(),
             "home_abbr": home.get("team", {}).get("abbreviation", "HOM")[:3].upper(),
@@ -1736,11 +1852,23 @@ class TidbytBaseballPlugin(BasePlugin):
         return 128, 32
 
     def _render_final_game(self, image, draw, game, width, height):
-        """Completed game: normal team columns, but the WINNING team's
-        bar is highlighted yellow instead of its usual team color, and
-        the black half just shows "FINAL" centered -- no diamond/
-        inning/etc, since there's no live situation to show."""
-        left_w = width // 2
+        """Left half: normal team columns (logo/abbreviation/score),
+        same as the live layout, with the WINNING team's bar
+        highlighted yellow. Right half: a compact inning-by-inning box
+        score confined to just that space -- no team-abbreviation
+        column in the grid itself, since the team names are already
+        shown on the left; the top grid row is away, bottom is home,
+        matching the left half's top/bottom team columns.
+
+        Data notes: per-inning linescores are a documented ESPN field
+        (confirmed via independent API documentation, not just
+        assumed), so those should be reliable. Hits/errors are NOT
+        confirmed in the lightweight scoreboard response the same way
+        -- they're backfilled from ESPN's detailed summary endpoint via
+        _enrich_boxscore_stats if missing, and simply left blank
+        (rather than showing a misleading 0) if that still doesn't
+        find them."""
+        left_w = int(width * 0.4)  # squeezed from 50% to give the box score grid more room
         col_w = left_w // 2
 
         draw.rectangle([0, 0, col_w - 1, height - 1], fill=self._darken_color(game["away_color"]))
@@ -1771,13 +1899,69 @@ class TidbytBaseballPlugin(BasePlugin):
 
         right_x0 = left_w + 2
         right_w = width - right_x0 - 1
-        font = self._load_font(10, bold=True)
-        text = "FINAL"
-        bbox = self._measure(font, text)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        tx = right_x0 + max((right_w - tw) // 2, 0)
-        ty = max((height - th) // 2, 0) - bbox[1]
-        self._render_text(image, (tx, ty), text, font, (255, 255, 255))
+
+        FENWAY_GREEN = (13, 46, 33)
+        GRID_LINE = (70, 100, 85)
+        TEXT_COLOR = (235, 235, 220)
+        WIN_COLOR = (255, 200, 0)
+
+        draw.rectangle([right_x0, 0, right_x0 + right_w - 1, height - 1], fill=FENWAY_GREEN)
+
+        away_ls = game.get("away_linescores") or []
+        home_ls = game.get("home_linescores") or []
+        num_innings = max(9, len(away_ls), len(home_ls))
+        # Guard against a very long extra-innings game making cells
+        # unreadably small -- cap displayed innings based on available
+        # width so cells never shrink below a legible floor, rather
+        # than a fixed cap regardless of space.
+        extra_cols = 3  # R, H, E
+        min_cell_w = 4
+        max_innings_that_fit = max(right_w // min_cell_w - extra_cols, 1)
+        num_innings = min(num_innings, max_innings_that_fit, 12)
+
+        total_cols = num_innings + extra_cols
+        cell_w = max(right_w // total_cols, min_cell_w)
+
+        row_h = height // 3
+        header_y = 0
+        away_y = row_h
+        home_y = row_h * 2
+
+        font = self.font_tiny
+
+        def draw_cell(x0, y0, w, h, text, color=TEXT_COLOR):
+            draw.rectangle([x0, y0, x0 + w - 1, y0 + h - 1], outline=GRID_LINE)
+            if text:
+                bbox = self._measure(font, text)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                tx = x0 + max((w - tw) // 2, 0)
+                ty = y0 + max((h - th) // 2, 0) - bbox[1]
+                self._render_text(image, (tx, ty), text, font, color)
+
+        # Header row: inning numbers, then R/H/E labels
+        x = right_x0
+        for i in range(num_innings):
+            draw_cell(x, header_y, cell_w, row_h, str(i + 1))
+            x += cell_w
+        for label in ("R", "H", "E"):
+            draw_cell(x, header_y, cell_w, row_h, label)
+            x += cell_w
+
+        def draw_team_row(y0, linescores, score, hits, errors, won):
+            row_color = WIN_COLOR if won else TEXT_COLOR
+            x = right_x0
+            for i in range(num_innings):
+                val = linescores[i] if i < len(linescores) else None
+                draw_cell(x, y0, cell_w, row_h, str(val) if val is not None else "")
+                x += cell_w
+            draw_cell(x, y0, cell_w, row_h, str(score), color=row_color)
+            x += cell_w
+            draw_cell(x, y0, cell_w, row_h, str(hits) if hits is not None else "", color=row_color)
+            x += cell_w
+            draw_cell(x, y0, cell_w, row_h, str(errors) if errors is not None else "", color=row_color)
+
+        draw_team_row(away_y, away_ls, game["away_score"], game.get("away_hits"), game.get("away_errors"), away_won)
+        draw_team_row(home_y, home_ls, game["home_score"], game.get("home_hits"), game.get("home_errors"), home_won)
 
     def _render_upcoming_game(self, image, draw, game, width, height):
         """Scheduled game that hasn't started: team columns show only
