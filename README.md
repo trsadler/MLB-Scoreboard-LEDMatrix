@@ -257,12 +257,16 @@ twice.
   decoding the actual bitmap data straight from the font file rather
   than guessing: at only 3 pixels wide, tom_thumb's "N" used three
   solid middle rows, differing from "M" by exactly one row --
-  genuinely ambiguous, not a rendering bug. Since this plugin bundles
-  its own copy of the font file specifically for itself, patched just
-  that one glyph to a zigzag diagonal pattern that's clearly distinct
-  from M, H, X, W, and every other letter checked. Verified the new
-  glyph renders pixel-for-pixel as intended through the actual BDF
-  parser, not just that the source file looks right.
+  genuinely ambiguous, not a rendering bug. First patch used a zigzag
+  diagonal; user then requested a specific alternate design instead
+  (verticals fully lit, single dot in the middle column, neighbors
+  above/below it off) -- which turned out to be pixel-identical to
+  this font's existing "H" glyph. Final version keeps that same
+  verticals-fully-lit concept but shifts the single dot to one row
+  above dead-center, avoiding the H collision while still matching
+  what was asked for. Verified pixel-for-pixel through the actual BDF
+  parser at each step, and checked against all 26 letters for
+  collisions, not just the two (M, H) already in question.
 
 ## Favorite-team priority cascade
 
