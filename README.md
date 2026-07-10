@@ -255,18 +255,19 @@ twice.
   neighboring columns unaffected.
 - **The "N" glyph really did look like "M"** -- confirmed this by
   decoding the actual bitmap data straight from the font file rather
-  than guessing: at only 3 pixels wide, tom_thumb's "N" used three
-  solid middle rows, differing from "M" by exactly one row --
-  genuinely ambiguous, not a rendering bug. First patch used a zigzag
-  diagonal; user then requested a specific alternate design instead
-  (verticals fully lit, single dot in the middle column, neighbors
-  above/below it off) -- which turned out to be pixel-identical to
-  this font's existing "H" glyph. Final version keeps that same
-  verticals-fully-lit concept but shifts the single dot to one row
-  above dead-center, avoiding the H collision while still matching
-  what was asked for. Verified pixel-for-pixel through the actual BDF
-  parser at each step, and checked against all 26 letters for
-  collisions, not just the two (M, H) already in question.
+  than guessing: at only 3 pixels wide, tom_thumb's "N" originally used
+  three solid middle rows, differing from "M" by exactly one row --
+  genuinely ambiguous, not a rendering bug. Iterated through several
+  designs (zigzag diagonal, single dot shifted off-center, a handful of
+  other diagonal/crossbar variations) before landing on the final
+  choice: verticals fully lit with a single dot at dead-center -- which
+  is pixel-identical to this font's "H" glyph. That's an intentional
+  choice, not an oversight: with only 3 columns to work with, no design
+  reads as a clearly "correct" N anyway, and this one was judged to
+  look the best on its own regardless of the H overlap, on the
+  reasoning that surrounding letters/word context make N vs. H
+  distinguishable in practice. Verified pixel-for-pixel through the
+  actual BDF parser at each iteration.
 
 ## Favorite-team priority cascade
 
