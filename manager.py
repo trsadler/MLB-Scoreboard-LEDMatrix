@@ -555,6 +555,18 @@ class TidbytBaseballPlugin(BasePlugin):
         prefix, rest = m.group(1), m.group(2)
         return self._draw_tight_join(image, x, y, font, fill, prefix, rest, ink_gap=ink_gap)
 
+    def _measure_name_tightened(self, font, name: str, ink_gap: int = 1) -> int:
+        """Width the tightened name would actually take up, WITHOUT
+        drawing to the real image. Reuses _draw_name_tightened itself
+        against a scratch canvas rather than reimplementing the
+        positioning math separately -- that duplication is exactly what
+        let measurement and final rendering drift apart before (fit
+        checks used the untightened width, so text that only fit
+        because of the tightening savings was truncating anyway, and
+        then even the truncated fallback skipped tightening entirely)."""
+        scratch = Image.new("RGB", (400, 30), (0, 0, 0))
+        return self._draw_name_tightened(scratch, (2, 2), font, (255, 255, 255), name, ink_gap=ink_gap)
+
     def _fit_font_for_width(self, draw, text: str, max_width: int, start_size: int, min_size: int = 4) -> Any:
         """Shrinks the font size until `text` fits within max_width.
         Works regardless of which font got auto-discovered, since
@@ -1456,6 +1468,35 @@ class TidbytBaseballPlugin(BasePlugin):
                 return
         self._render_text(image, (x, y), text_to_draw, font, (255, 60, 0))
 
+    def _draw_pitch_line(self, image, xy, font, fill, pitch_count, name, ink_gap: int = 1) -> int:
+        """Draws 'P:<count> <name>' (or just name, if no count) with
+        the P-colon gap and the name's initial-period gap both
+        tightened. Single source of truth used for both measuring
+        (via a scratch canvas) and final rendering, so they can never
+        drift apart -- that drift (measuring untightened width, then
+        only tightening if nothing needed truncating) was the actual
+        bug: any name long enough to need truncation skipped tightening
+        entirely, which is backwards since those are exactly the names
+        that benefit from it most."""
+        x, y = xy
+        cursor = x
+        if pitch_count is not None:
+            w = self._draw_tight_join(image, cursor, y, font, fill, "P", ":", ink_gap=ink_gap)
+            cursor += w + 2
+            count_str = str(pitch_count)
+            self._render_text(image, (cursor, y), count_str, font, fill)
+            count_bbox = self._measure(font, count_str)
+            cursor += (count_bbox[2] - count_bbox[0]) + 3
+        name_w = self._draw_name_tightened(image, (cursor, y), font, fill, name, ink_gap=ink_gap)
+        cursor += name_w
+        return cursor - x
+
+    def _measure_pitch_line(self, font, pitch_count, name, ink_gap: int = 1) -> int:
+        """Width _draw_pitch_line would actually use, without touching
+        the real image."""
+        scratch = Image.new("RGB", (400, 30), (0, 0, 0))
+        return self._draw_pitch_line(scratch, (2, 2), font, (255, 255, 255), pitch_count, name, ink_gap=ink_gap)
+
     def _draw_pitch_info(self, image, draw, x, y, max_width, pitch_count, pitcher_name, pitcher_short_name):
         """Draws 'P:<count> <Pitcher Name>' at the top of the black
         half. Returns the pixel height actually used, so the caller can
@@ -1466,11 +1507,13 @@ class TidbytBaseballPlugin(BasePlugin):
         appear to include a pitch-count field at all (see
         extract_pitch_count's docstring in _parse_game). If pitch_count
         never populates for you, that's most likely ESPN's lightweight
-        scoreboard endpoint simply not exposing it -- getting a reliable
-        live pitch count would likely need an extra per-game API call
-        to ESPN's more detailed boxscore/summary endpoint. Let me know
-        if you want that added; it's an extra request per game per poll
-        rather than a quick fix.
+        scoreboard endpoint simply not exposing it.
+
+        If the full name doesn't fit even at the smallest font size,
+        truncates the NAME specifically (never the "P:<count>" prefix)
+        character-by-character with a trailing "." -- using the same
+        tightened-width measurement throughout, so tightening is never
+        silently skipped the way it was before.
 
         If there's no pitcher name at all, draws nothing and returns 0
         so the diamond simply moves up to fill the freed space."""
@@ -1478,47 +1521,26 @@ class TidbytBaseballPlugin(BasePlugin):
             return 0
 
         name = pitcher_short_name or self._format_batter_name(pitcher_name)
-        text = f"P:{pitch_count} {name}" if pitch_count is not None else name
-
-        font = self._fit_font_for_width(draw, text, max_width, start_size=7, min_size=4)
-        bbox = self._measure(font, text)
-        text_to_draw = text
-        if bbox[2] - bbox[0] > max_width:
-            truncated = text
-            text_to_draw = None
-            while truncated:
-                candidate = truncated + "."
-                cbbox = self._measure(font, candidate)
-                if cbbox[2] - cbbox[0] <= max_width:
-                    text_to_draw = candidate
-                    break
-                truncated = truncated[:-1]
-            if text_to_draw is None:
-                return 0
-
         color = (180, 180, 220)
-        if text_to_draw == text:
-            # No truncation happened -- safe to apply the structured
-            # tight-join rendering (P-colon gap, and the initial+period
-            # to lastname gap, both tightened to real measured ink gaps
-            # instead of the font's natural blank design space).
-            if pitch_count is not None:
-                cursor_w = self._draw_tight_join(image, x, y, font, color, "P", ":", ink_gap=1)
-                count_x = x + cursor_w + 2
-                self._render_text(image, (count_x, y), str(pitch_count), font, color)
-                count_bbox = self._measure(font, str(pitch_count))
-                name_x = count_x + (count_bbox[2] - count_bbox[0]) + 3
-                self._draw_name_tightened(image, (name_x, y), font, color, name, ink_gap=1)
-            else:
-                self._draw_name_tightened(image, (x, y), font, color, name, ink_gap=1)
-        else:
-            # Truncated fallback -- just render the truncated fragment
-            # plainly rather than trying to re-derive tightened segment
-            # boundaries out of a string that's been cut mid-word.
-            self._render_text(image, (x, y), text_to_draw, font, color)
+        sizing_text = f"P:{pitch_count} {name}" if pitch_count is not None else name
+        font = self._fit_font_for_width(draw, sizing_text, max_width, start_size=7, min_size=4)
 
-        final_bbox = self._measure(font, text_to_draw)
-        return final_bbox[3] - final_bbox[1]
+        candidate_name = name
+        final_name = None
+        while candidate_name:
+            trial = candidate_name if candidate_name == name else candidate_name + "."
+            width = self._measure_pitch_line(font, pitch_count, trial, ink_gap=1)
+            if width <= max_width:
+                final_name = trial
+                break
+            candidate_name = candidate_name[:-1]
+
+        if final_name is None:
+            return 0
+
+        used_w = self._draw_pitch_line(image, (x, y), font, color, pitch_count, final_name, ink_gap=1)
+        bbox = self._measure(font, final_name)
+        return bbox[3] - bbox[1]
 
     def _draw_batter(self, image, draw, x, y, max_width, batter_name, batter_short_name=None):
         """Draws whoever is currently at bat, shrunk to fit whatever
@@ -1532,40 +1554,31 @@ class TidbytBaseballPlugin(BasePlugin):
         Falls back to our own `_format_batter_name` if shortName wasn't
         available for some reason.
 
-        If the name doesn't fit even at the smallest allowed font size
-        (confirmed with real ESPN data: "Kevin McGonigle" -> "K. McGonigle"
-        is 12 characters, wider than the ~44px available even at the
-        floor size), truncate character-by-character with a trailing
-        "." rather than silently drawing nothing. The old version's
-        safety check against overflow had the side effect of hiding the
-        batter name entirely for any name too long to fully fit -- which
-        in practice was most real player names, not an edge case."""
+        Truncation decisions and the final render both use
+        `_measure_name_tightened`/`_draw_name_tightened` -- the SAME
+        tightened-width calculation throughout. Previously, truncation
+        was decided using the untightened width, then tightening was
+        only applied if no truncation happened at all -- so any name
+        long enough to need truncation (common, not rare) silently
+        skipped tightening entirely, which is backwards: those are
+        exactly the names that benefit from it most."""
         if (not batter_name and not batter_short_name) or max_width <= 0:
             return
         formatted = batter_short_name or self._format_batter_name(batter_name)
         font = self._fit_font_for_width(draw, formatted, max_width, start_size=7, min_size=4)
-        bbox = self._measure(font, formatted)
 
-        text_to_draw = formatted
-        if bbox[2] - bbox[0] > max_width:
-            truncated = formatted
-            text_to_draw = None
-            while truncated:
-                candidate = truncated + "."
-                cbbox = self._measure(font, candidate)
-                if cbbox[2] - cbbox[0] <= max_width:
-                    text_to_draw = candidate
-                    break
-                truncated = truncated[:-1]
-            if text_to_draw is None:
-                return  # nothing fits, not even a single truncated character
-
-        if text_to_draw == formatted:
-            self._draw_name_tightened(image, (x, y), font, (200, 200, 200), text_to_draw, ink_gap=1)
+        candidate = formatted
+        while candidate:
+            trial = candidate if candidate == formatted else candidate + "."
+            width = self._measure_name_tightened(font, trial, ink_gap=1)
+            if width <= max_width:
+                text_to_draw = trial
+                break
+            candidate = candidate[:-1]
         else:
-            # Truncated -- render plainly rather than re-deriving
-            # tightened segment boundaries from a cut-off string.
-            self._render_text(image, (x, y), text_to_draw, font, (200, 200, 200))
+            return  # nothing fits, not even a single truncated character
+
+        self._draw_name_tightened(image, (x, y), font, (200, 200, 200), text_to_draw, ink_gap=1)
 
     def _draw_outs(self, draw, cx, center_y, game, size=3, gap=1):
         """Vertically stacked circles (top to bottom = out 1, 2, 3),

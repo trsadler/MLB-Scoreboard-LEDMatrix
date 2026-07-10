@@ -209,7 +209,38 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
-## Batter left-aligned, count moved to bottom-right corner
+## Fixed: tightening was silently skipped whenever truncation kicked in
+
+This was a real, systemic bug, not occasional -- confirmed by testing
+several realistic pitcher name/pitch-count combinations against the
+actual layout width: `"P:112 R. Zeferjahn"` and `"P:134 K. McGonigle"`
+both needed truncation even at the smallest font size, while shorter
+ones like `"P:47 T. Skubal"` didn't. The previous code only applied
+tightening in an `if text_to_draw == text:` branch -- i.e., only when
+NO truncation happened. Any name long enough to need truncation (which
+turns out to be common, not rare) fell back to plain, untightened
+rendering. That's backwards: those are exactly the names that benefit
+from tightening the most, and the whole point of tightening was to fit
+more of them in.
+
+**Rebuilt both `_draw_pitch_info` and `_draw_batter`** around a single
+draw/measure function each (`_draw_pitch_line`/`_measure_pitch_line`
+and `_draw_name_tightened`/`_measure_name_tightened`), so measurement
+and final rendering can never drift apart again -- the measurement
+functions literally call the drawing functions against a scratch
+canvas rather than reimplementing the position math separately, which
+is what let this bug happen in the first place.
+
+**Also changed what gets truncated**: instead of trimming characters
+off the end of the whole combined string (which could theoretically
+eat into the "P:47" prefix), truncation now only ever shortens the
+pitcher/batter NAME, leaving the pitch count intact.
+
+Verified by re-testing the exact names that triggered the bug --
+confirmed tightened gaps (1px) now appear at both junctions even in
+cases that need truncation, not just the cases that fit without it.
+
+
 
 Batter name now starts at the same left x-position as the inning
 indicator and pitch count/pitcher name above it, for a consistent left
