@@ -35,8 +35,13 @@ RGB PIL.Image internally and then tries, in order:
     2. display_manager.set_image(...)
 """
 
+import datetime
 import logging
+import math
 import os
+import random
+import re
+import threading
 import time
 from io import BytesIO
 from typing import Optional, Dict, Any, Tuple, List
@@ -58,9 +63,10 @@ except ImportError:
 
 
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard"
+ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary"
 
-DEFAULT_AWAY_COLOR = (0, 142, 226)
-DEFAULT_HOME_COLOR = (200, 16, 46)
+DEFAULT_AWAY_COLOR = (255, 255, 255)
+DEFAULT_HOME_COLOR = (255, 255, 255)
 
 # Fonts bundled directly with this plugin (in ./fonts/), pulled from the
 # same assets/fonts/ folder the core LEDMatrix project ships with, so
@@ -90,6 +96,31 @@ FONT_CHOICES = {
 # fixed pixel size), so they skip the shrink-to-fit sizing logic used
 # for the TTF options.
 BDF_FONT_CHOICES = {"tom_thumb"}
+
+# Routine pitch-by-pitch play types to SKIP when last_play_filter is
+# "significant" -- i.e., don't flash for these, only for actual outcomes
+# (hits, walks, strikeouts, outs, runs, etc.). This is a denylist rather
+# than an allowlist of "big moment" types on purpose: only two real
+# samples of situation.lastPlay.type.type have been confirmed so far
+# ("ball" and "start-batterpitcher"), so a denylist means an unknown
+# type defaults to SHOWING (safer for not missing a real highlight)
+# rather than defaulting to hidden. Add more here if routine updates
+# still slip through once you see this against more live data.
+NON_SIGNIFICANT_PLAY_TYPES = {
+    "ball", "strike", "strike-looking", "strike-swinging",
+    "foul", "foul-ball", "foul-tip",
+    "start-batterpitcher", "pitch", "no-pitch",
+    "automatic-ball", "automatic-strike", "warmup",
+}
+
+# Best-effort guess at ESPN's home-run type code -- I have NOT confirmed
+# any of these against real data (unlike NON_SIGNIFICANT_PLAY_TYPES,
+# where "ball" and "start-batterpitcher" are both confirmed real
+# samples). If the special home-run animation never triggers on an
+# actual home run, check the plugin logs for the line "Last-play flash
+# QUEUED for ... (type=...)" during a real home run and add whatever
+# the actual type string is to this set.
+HOME_RUN_PLAY_TYPES = {"home-run", "homerun", "home_run", "hr", "home run"}
 
 # Preference order for auto-discovering a bundled font from the main
 # LEDMatrix install, used only when font_choice is "system" or the
@@ -209,10 +240,45 @@ class TidbytBaseballPlugin(BasePlugin):
         self.session.headers.update({"User-Agent": "LEDMatrix-TidbytBaseball/1.0"})
 
         self.live_games: List[Dict[str, Any]] = []
+        self.past_games: List[Dict[str, Any]] = []
+        self.upcoming_games: List[Dict[str, Any]] = []
+        self.rotation_games: List[Dict[str, Any]] = []  # what _current_game()/_maybe_rotate() actually cycle through
+
+        # ESPN's scoreboard endpoint defaults to TODAY's games only with
+        # no date parameter -- a favorite team's actual next game is
+        # almost always tomorrow or later (not today), so relying on the
+        # main scoreboard fetch alone means upcoming_games is nearly
+        # always empty. This cache holds results from explicitly querying
+        # the next few days (see _fetch_future_upcoming_games), refreshed
+        # on its own slower timer since schedules barely change.
+        self._cached_future_upcoming_games: List[Dict[str, Any]] = []
+        self._upcoming_last_fetch_time: float = 0.0
         self.fallback_game: Optional[Dict[str, Any]] = None
         self.current_index: int = 0
         self.last_switch_time: float = time.time()
         self.last_fetch_time: float = 0.0
+
+        # Per-game (keyed by event_id) last-play flash state. Games get
+        # entirely new dicts each poll (live_games is rebuilt from
+        # scratch), so this has to live on self, not on the game dict,
+        # to persist across polls.
+        #
+        # IMPORTANT: this is a QUEUE + single "active" slot, not just a
+        # per-game expiry timestamp. A plain "flash_until per event_id"
+        # design (the original version) let a significant play's flash
+        # window start counting down the moment it was DETECTED,
+        # completely independent of whether that game was actually on
+        # screen -- normal rotation runs on its own separate timer with
+        # no awareness of pending flashes. With 2+ live games rotating,
+        # a flash could easily expire before rotation ever got around to
+        # showing that game, so the person never saw it -- exactly the
+        # "works intermittently" symptom. The queue below is serviced by
+        # _service_flash_queue(), called before rotation each frame, so
+        # a pending flash can force-jump the display to the right game
+        # (pausing normal rotation) and guarantee it's actually seen.
+        self._last_shown_play_id: Dict[str, str] = {}
+        self._pending_flash_event_ids: List[str] = []
+        self._active_flash: Optional[Dict[str, Any]] = None
 
         self._logo_cache: Dict[str, Optional[Image.Image]] = {}
         self._font_cache: Dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
@@ -273,6 +339,45 @@ class TidbytBaseballPlugin(BasePlugin):
                 f"requested sizes. Check all the errors logged above for why."
             )
 
+        # Guards concurrent access to live_games/fallback_game/current_index
+        # between the background thread below and display()/update() being
+        # called from whatever thread the core scheduler uses.
+        self._data_lock = threading.Lock()
+
+        # IMPORTANT: this plugin no longer relies solely on the core
+        # calling update() often enough. Earlier debugging (score
+        # staying frozen after the first successful load, even after
+        # fixing an unrelated exception-swallowing bug) pointed at the
+        # core scheduler likely only calling update() when this
+        # plugin's rotation slot is active on screen -- not
+        # continuously in the background. Rather than depend on that,
+        # this background thread polls ESPN on its own schedule,
+        # completely independent of how often update()/display() get
+        # invoked externally. update() still exists and still works if
+        # the core DOES call it regularly (both paths share the same
+        # underlying _maybe_refresh() logic, gated by the same
+        # last_fetch_time check, so there's no duplicate-fetch risk).
+        self._stop_background_thread = threading.Event()
+        self._background_thread = threading.Thread(
+            target=self._background_update_loop, daemon=True, name=f"{plugin_id}-updater"
+        )
+        self._background_thread.start()
+
+    def _background_update_loop(self):
+        """Runs for the lifetime of the process, independent of
+        whatever the core scheduler's calling pattern for update() is.
+        Sleeps briefly between checks so it responds quickly once a
+        game goes live, but the actual fetch still only happens as
+        often as live_update_interval_seconds/update_interval_seconds
+        allow (via _maybe_refresh's own interval check) -- this thread
+        just guarantees SOMETHING is checking regularly."""
+        while not self._stop_background_thread.is_set():
+            try:
+                self._maybe_refresh()
+            except Exception as e:
+                self.logger.error(f"Background updater thread hit an unexpected error: {e}", exc_info=True)
+            self._stop_background_thread.wait(timeout=5)
+
     # ------------------------------------------------------------------
     # Config handling
     # ------------------------------------------------------------------
@@ -293,23 +398,32 @@ class TidbytBaseballPlugin(BasePlugin):
         self.base_empty_color = tuple(cfg.get("base_empty_color", [95, 95, 95]))
         self.out_fill_color = tuple(cfg.get("out_fill_color", [255, 140, 0]))
         self.out_empty_color = tuple(cfg.get("out_empty_color", [120, 120, 120]))
-        self.font_choice = cfg.get("font_choice", "tom_thumb")
+        self.font_choice = "tom_thumb"  # no longer user-configurable -- see FONT_CHOICES for fallback chain if this fails to load
         self.show_batter_name = cfg.get("show_batter_name", True)
+        self.show_last_play = cfg.get("show_last_play", True)
+        self.last_play_display_seconds = cfg.get("last_play_display_seconds", 5)
+        self.last_play_filter = cfg.get("last_play_filter", "significant")
+        self.show_past_games = cfg.get("show_past_games", False)
+        self.show_upcoming_games = cfg.get("show_upcoming_games", False)
+        self.max_past_games = cfg.get("max_past_games", 3)
+        self.max_upcoming_games = cfg.get("max_upcoming_games", 3)
+        self.past_upcoming_all_teams = cfg.get("past_upcoming_all_teams", False)
+        self.upcoming_games_lookahead_days = cfg.get("upcoming_games_lookahead_days", 5)
+        self.upcoming_games_refresh_seconds = cfg.get("upcoming_games_refresh_seconds", 1800)
         self.test_mode = cfg.get("test_mode", False)
 
     def on_config_change(self, new_config):
         self.config = new_config
-        old_font_choice = getattr(self, "font_choice", None)
         self._derive_settings()
-        self.last_fetch_time = 0
-        if self.font_choice != old_font_choice:
-            # Selected font changed -- clear caches so _load_font picks
-            # up the new one instead of returning a stale cached object.
-            self._font_cache.clear()
-            self._fit_font_cache.clear()
-            self.font_small = self._load_font(9)
-            self.font_tiny = self._load_font(7)
-            self.font_count = self._load_font(6)
+        with self._data_lock:
+            self.last_fetch_time = 0
+
+    def cleanup(self):
+        """Called by the core on plugin unload/disable, if it supports
+        that -- stops the background updater thread cleanly. Harmless
+        no-op risk if the core never calls this (the thread is a daemon
+        thread anyway, so it won't block process exit either way)."""
+        self._stop_background_thread.set()
 
     def validate_config(self) -> bool:
         if not self.favorite_teams:
@@ -445,6 +559,78 @@ class TidbytBaseballPlugin(BasePlugin):
         else:
             ImageDraw.Draw(image).text(xy, text, font=font, fill=fill)
 
+    def _ink_extent(self, font: Any, text: str) -> Tuple[int, int]:
+        """Renders `text` to a small scratch image and returns the
+        actual leftmost/rightmost columns containing ink (non-background
+        pixels) -- as opposed to the font's nominal advance width, which
+        for punctuation like ":" or "." often includes several columns
+        of blank design space the font author left for normal spacing.
+        Measuring real ink is what lets tightening work correctly
+        regardless of which font is active, rather than guessing a
+        fixed pixel offset tuned for one specific font."""
+        bbox = self._measure(font, text)
+        w = max(bbox[2] - bbox[0], 1) + 6
+        h = max(bbox[3] - bbox[1], 1) + 6
+        scratch = Image.new("RGB", (w, h), (0, 0, 0))
+        self._render_text(scratch, (3, 3), text, font, (255, 255, 255))
+        cols = [x for x in range(w) for y in range(h) if scratch.getpixel((x, y)) != (0, 0, 0)]
+        if not cols:
+            return (3, 3)
+        return (min(cols), max(cols))
+
+    def _draw_tight_join(self, image, x, y, font, fill, text_a: str, text_b: str, ink_gap: int = 1) -> int:
+        """Draws text_a then text_b immediately after it, with only
+        `ink_gap` background pixels between their actual rendered ink
+        -- not their nominal advance widths. This is what actually
+        tightens up spacing like "P:" or "T. Lastname": the blank space
+        people see isn't extra spacing added between characters, it's
+        blank design space baked into narrow glyphs (colons, periods)
+        that a font author left for normal-width spacing. Returns the
+        total pixel width used, for cursor advancement."""
+        self._render_text(image, (x, y), text_a, font, fill)
+        _, a_right_scratch = self._ink_extent(font, text_a)
+        a_right_actual = x + (a_right_scratch - 3)
+
+        b_left_scratch, b_right_scratch = self._ink_extent(font, text_b)
+        # Target: B's first ink column should land at (A's last ink
+        # column + 1 + ink_gap) -- the "+1" is because a_right_actual
+        # IS the last ink pixel, so the very next column is already 0
+        # gap; ink_gap blank columns after that is where B's ink starts.
+        b_x = (a_right_actual + 1 + ink_gap) - (b_left_scratch - 3)
+        self._render_text(image, (b_x, y), text_b, font, fill)
+
+        b_bbox = self._measure(font, text_b)
+        return (b_x + (b_bbox[2] - b_bbox[0])) - x
+
+    def _draw_name_tightened(self, image, xy, font, fill, name: str, ink_gap: int = 1) -> int:
+        """Draws a 'F. Lastname'-style string with the gap after the
+        initial+period tightened to `ink_gap` real pixels instead of
+        whatever blank space the space character/font design normally
+        leaves (measured as 6px of pure blank for tom_thumb's "T. " --
+        see the investigation that led to this). Falls back to a plain
+        render if the string doesn't match that pattern. Returns the
+        pixel width used."""
+        x, y = xy
+        m = re.match(r"^([A-Za-z]{1,2}\.) (.+)$", name)
+        if not m:
+            self._render_text(image, (x, y), name, font, fill)
+            bbox = self._measure(font, name)
+            return bbox[2] - bbox[0]
+        prefix, rest = m.group(1), m.group(2)
+        return self._draw_tight_join(image, x, y, font, fill, prefix, rest, ink_gap=ink_gap)
+
+    def _measure_name_tightened(self, font, name: str, ink_gap: int = 1) -> int:
+        """Width the tightened name would actually take up, WITHOUT
+        drawing to the real image. Reuses _draw_name_tightened itself
+        against a scratch canvas rather than reimplementing the
+        positioning math separately -- that duplication is exactly what
+        let measurement and final rendering drift apart before (fit
+        checks used the untightened width, so text that only fit
+        because of the tightening savings was truncating anyway, and
+        then even the truncated fallback skipped tightening entirely)."""
+        scratch = Image.new("RGB", (400, 30), (0, 0, 0))
+        return self._draw_name_tightened(scratch, (2, 2), font, (255, 255, 255), name, ink_gap=ink_gap)
+
     def _fit_font_for_width(self, draw, text: str, max_width: int, start_size: int, min_size: int = 4) -> Any:
         """Shrinks the font size until `text` fits within max_width.
         Works regardless of which font got auto-discovered, since
@@ -519,22 +705,40 @@ class TidbytBaseballPlugin(BasePlugin):
     # Data fetching
     # ------------------------------------------------------------------
     def update(self):
-        now = time.time()
-        has_data = bool(self.live_games) or self.fallback_game is not None
-        interval = self.live_update_interval if self.live_games else self.update_interval
+        """Called by the core scheduler, if/whenever it calls it. Just
+        delegates to _maybe_refresh() -- the actual polling now also
+        happens independently via the background thread started in
+        __init__, so data refreshes either way regardless of the core's
+        calling cadence for this method."""
+        self._maybe_refresh()
 
-        if has_data and (now - self.last_fetch_time < interval):
+    def _maybe_refresh(self):
+        now = time.time()
+        with self._data_lock:
+            has_data = bool(self.live_games) or self.fallback_game is not None
+            interval = self.live_update_interval if self.live_games else self.update_interval
+            seconds_since_last = now - self.last_fetch_time
+            should_skip = has_data and (seconds_since_last < interval)
+
+        if should_skip:
+            self.logger.debug(
+                f"Skipping fetch -- only {seconds_since_last:.1f}s since last fetch "
+                f"(interval is {interval}s)."
+            )
             return
 
-        self.last_fetch_time = now
+        with self._data_lock:
+            self.last_fetch_time = now
 
         if self.test_mode:
             game = self._fake_game()
             self._resolve_logos(game)
-            self.live_games = [game]
-            self.fallback_game = None
-            if self.current_index >= len(self.live_games):
-                self.current_index = 0
+            with self._data_lock:
+                self.live_games = [game]
+                self.fallback_game = None
+                self.rotation_games = [game]
+                if self.current_index >= len(self.rotation_games):
+                    self.current_index = 0
             return
 
         try:
@@ -545,21 +749,394 @@ class TidbytBaseballPlugin(BasePlugin):
             self.logger.error(f"Failed to fetch MLB scoreboard: {e}", exc_info=True)
             return
 
-        live_games, fallback_game = self._process_scoreboard(data)
+        # IMPORTANT: this whole block used to be unprotected. If any
+        # single game had an unusual shape ESPN sometimes sends
+        # (pitching change, extra innings, a null field mid-play, etc.)
+        # that our parsing code didn't handle, the exception would
+        # propagate straight out uncaught. Wrapping this means a single
+        # bad game/response degrades gracefully (keeps last-known-good
+        # data, tries again next interval) instead of permanently
+        # freezing everything.
+        try:
+            live_games, past_games, upcoming_games, fallback_game = self._process_scoreboard(data)
 
-        for g in live_games:
-            self._resolve_logos(g)
-        if fallback_game:
-            self._resolve_logos(fallback_game)
+            # ESPN's main scoreboard call only covers today -- merge in
+            # the separately-cached multi-day lookahead so upcoming_games
+            # isn't nearly always empty (see _fetch_future_upcoming_games
+            # for why). Only re-queries the future days on its own slower
+            # timer, since schedules barely change within a day.
+            now_ts = time.time()
+            if self.show_upcoming_games and (now_ts - self._upcoming_last_fetch_time >= self.upcoming_games_refresh_seconds):
+                try:
+                    self._cached_future_upcoming_games = self._fetch_future_upcoming_games()
+                    self._upcoming_last_fetch_time = now_ts
+                except Exception as e:
+                    self.logger.warning(f"Upcoming-games lookahead failed, keeping previous cache: {e}")
 
-        self.live_games = live_games
-        self.fallback_game = fallback_game
-        if self.current_index >= len(self.live_games):
-            self.current_index = 0
+            if self.show_upcoming_games:
+                combined_upcoming = {g["event_id"]: g for g in upcoming_games}
+                for g in self._cached_future_upcoming_games:
+                    combined_upcoming.setdefault(g["event_id"], g)
+                upcoming_games = sorted(combined_upcoming.values(), key=lambda g: g.get("event_date_raw") or "")
+                upcoming_games = upcoming_games[: self.max_upcoming_games]
+
+            for g in live_games + past_games + upcoming_games:
+                self._resolve_logos(g)
+            if fallback_game:
+                self._resolve_logos(fallback_game)
+
+            # --- Favorite-team priority cascade ---
+            # 1. If ANY favorite team has a live game right now, show
+            #    ONLY that (those) live game(s) -- past/upcoming and
+            #    every other team's live game are fully suppressed
+            #    while a favorite is live.
+            # 2. Otherwise, if show_favorite_teams_only is OFF: show
+            #    every live game (any team) plus past/upcoming (scope
+            #    controlled separately by past_upcoming_all_teams).
+            # 2s. Otherwise (show_favorite_teams_only is ON, strict
+            #     mode): show only favorites' past/upcoming -- no other
+            #     team's live game ever appears.
+            # 3. Falls out naturally: if the live portion is empty in
+            #    either branch, rotation is just past/upcoming; if ALL
+            #    of that is empty too, fall back to the single
+            #    best-guess favorite game (preserves pre-this-feature
+            #    behavior for anyone with everything else off).
+            favorite_live_games = [
+                g for g in live_games
+                if g["away_abbr"] in self.favorite_teams or g["home_abbr"] in self.favorite_teams
+            ]
+
+            if favorite_live_games:
+                rotation_games = list(favorite_live_games)
+                cascade_state = "favorite team(s) live -- showing only that"
+            elif self.show_favorite_teams_only:
+                rotation_games = []
+                if self.show_past_games:
+                    rotation_games += past_games
+                if self.show_upcoming_games:
+                    rotation_games += upcoming_games
+                cascade_state = "strict mode, no favorite live -- favorites' past/upcoming only"
+            else:
+                rotation_games = list(live_games)
+                if self.show_past_games:
+                    rotation_games += past_games
+                if self.show_upcoming_games:
+                    rotation_games += upcoming_games
+                cascade_state = "no favorite live -- showing all live games + past/upcoming"
+
+            if not rotation_games and fallback_game:
+                rotation_games = [fallback_game]
+                cascade_state += " (nothing available -- using single fallback game)"
+
+            # Real pitch count isn't in the lightweight scoreboard
+            # response (confirmed from actual captured data) -- fetch
+            # it from ESPN's more detailed per-game summary endpoint
+            # instead. Wrapped in its own try/except per game so one
+            # game's summary failing (or ESPN changing that endpoint's
+            # shape) can't take down the main scoreboard update.
+            #
+            # IMPORTANT: this only runs on the LIVE games actually
+            # selected into rotation_games, not every live game
+            # leaguewide -- "show all live games" mode could otherwise
+            # mean fetching a summary for a dozen simultaneous MLB
+            # games every poll, which is a lot of extra requests for
+            # data that never even gets displayed.
+            enrich_targets = [g for g in rotation_games if g.get("game_type") == "live"]
+            for g in enrich_targets:
+                try:
+                    self._enrich_pitch_count(g)
+                except Exception as e:
+                    self.logger.warning(f"Could not fetch pitch count for {g['away_abbr']}@{g['home_abbr']}: {e}")
+
+            for g in enrich_targets:
+                try:
+                    self._maybe_trigger_last_play_flash(g)
+                except Exception as e:
+                    self.logger.warning(f"Error checking last-play flash for {g['away_abbr']}@{g['home_abbr']}: {e}")
+
+            self.logger.info(
+                f"Fetched scoreboard OK: {len(live_games)} live game(s) leaguewide, "
+                f"{len(favorite_live_games)} involving a favorite team, "
+                f"{len(past_games)} past, {len(upcoming_games)} upcoming. "
+                f"Cascade: {cascade_state}. Rotation has {len(rotation_games)} game(s)."
+            )
+
+            with self._data_lock:
+                self.live_games = live_games
+                self.past_games = past_games
+                self.upcoming_games = upcoming_games
+                self.fallback_game = fallback_game
+                self.rotation_games = rotation_games
+                if self.current_index >= len(self.rotation_games):
+                    self.current_index = 0
+        except Exception as e:
+            self.logger.error(
+                f"Fetched scoreboard successfully but failed to parse/process it: {e}. "
+                f"Keeping last-known-good data instead of crashing -- will try again "
+                f"next update cycle. If this repeats every time, something about the "
+                f"CURRENT game state (extra innings, pitching change, etc.) is hitting "
+                f"a parsing bug -- please share this traceback.",
+                exc_info=True,
+            )
+
+    def _maybe_trigger_last_play_flash(self, game: Dict[str, Any]):
+        """Detects when a game has a NEW play (by comparing lastPlay's
+        id against what we last saw for this specific game, keyed by
+        event_id since game dicts are rebuilt fresh every poll) and, if
+        it's a "significant" play type, QUEUES it to be flashed. The
+        actual timing/expiry is handled by _service_flash_queue(),
+        called from display() before rotation -- this function only
+        decides WHETHER something should flash, never when or for how
+        long, since that's what guarantees it's actually shown (see the
+        big comment on _pending_flash_event_ids in __init__).
+
+        Deliberately does NOT flash the very first time we ever see a
+        given game (i.e., when we have no previous play id to compare
+        against) -- otherwise every game would flash immediately on
+        first load / plugin startup for whatever play happened to be
+        current already, which isn't really a "new" play from the
+        person watching the display's perspective."""
+        if not self.show_last_play:
+            return
+        event_id = game.get("event_id")
+        play_id = game.get("last_play_id")
+        if not event_id or not play_id:
+            return
+
+        with self._data_lock:
+            previous_id = self._last_shown_play_id.get(event_id)
+            self._last_shown_play_id[event_id] = play_id
+
+            if previous_id is None or play_id == previous_id:
+                return  # first time seeing this game, or no change
+
+            play_type = (game.get("last_play_type") or "").lower()
+            is_significant = (
+                self.last_play_filter != "significant"
+                or play_type not in NON_SIGNIFICANT_PLAY_TYPES
+            )
+            if is_significant:
+                already_active = self._active_flash and self._active_flash.get("event_id") == event_id
+                already_pending = event_id in self._pending_flash_event_ids
+                if not already_active and not already_pending:
+                    self._pending_flash_event_ids.append(event_id)
+                    self.logger.info(
+                        f"Last-play flash QUEUED for {game['away_abbr']}@{game['home_abbr']}: "
+                        f"\"{game.get('last_play_text')}\" (type={play_type})"
+                    )
+
+    def _service_flash_queue(self) -> Optional[Dict[str, Any]]:
+        """Called from display(), before rotation. Returns a dict with
+        the active flash's event_id/started_at/duration for this
+        frame, or None if nothing's flashing. Also promotes the next
+        queued flash (if any) into the active slot, force-jumping
+        current_index to that game so it's guaranteed to actually be
+        displayed rather than hoping normal rotation gets there before
+        the flash would've expired -- that race condition was the
+        actual bug behind the flash "only working intermittently"
+        during multi-game nights."""
+        with self._data_lock:
+            now = time.time()
+            if self._active_flash and now >= self._active_flash["expires_at"]:
+                self._active_flash = None
+                self.last_switch_time = now  # give normal rotation a fresh full window right after
+
+            if self._active_flash is None and self._pending_flash_event_ids:
+                next_event_id = self._pending_flash_event_ids.pop(0)
+                self._active_flash = {
+                    "event_id": next_event_id,
+                    "started_at": now,
+                    "duration": self.last_play_display_seconds,
+                    "expires_at": now + self.last_play_display_seconds,
+                }
+                matched = False
+                for idx, g in enumerate(self.rotation_games):
+                    if g.get("event_id") == next_event_id:
+                        self.current_index = idx
+                        matched = True
+                        break
+                self.logger.info(
+                    f"Last-play flash NOW SHOWING (event_id={next_event_id}, "
+                    f"matched to a currently-live game: {matched})"
+                )
+
+            return dict(self._active_flash) if self._active_flash else None
+
+    def _enrich_pitch_count(self, game: Dict[str, Any]):
+        """Fetches ESPN's detailed per-game summary endpoint and tries
+        to find the current pitcher's live pitch count in it. The
+        lightweight scoreboard endpoint doesn't have this (confirmed
+        from real captured data), so this is a second API call per live
+        game per poll cycle.
+
+        ESPN's summary endpoint isn't officially documented either, so
+        this tries a few plausible paths first, then falls back to a
+        generic recursive scan for any key that looks like a pitch
+        count. If NONE of this finds it, logs the raw structure at
+        DEBUG level (only fires once you actually enable debug logging)
+        so we have real data to fix this precisely rather than guessing
+        again -- same approach that worked for the batter name."""
+        event_id = game.get("event_id")
+        if not event_id:
+            return
+
+        resp = self.session.get(ESPN_SUMMARY_URL, params={"event": event_id}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        pitcher_id = None
+        try:
+            # Re-derive the pitcher's ID the same way the scoreboard did,
+            # so we can match them up in the summary's boxscore section.
+            for comp in data.get("header", {}).get("competitions", []):
+                situation = comp.get("situation", {})
+                pid = situation.get("pitcher", {}).get("playerId") or situation.get("pitcher", {}).get("athlete", {}).get("id")
+                if pid:
+                    pitcher_id = str(pid)
+                    break
+        except Exception:
+            pass
+
+        count = self._find_pitch_count(data, pitcher_id)
+        if count is not None:
+            game["pitch_count"] = count
+        else:
+            self.logger.debug(
+                f"Could not find a pitch count in the summary response for "
+                f"{game['away_abbr']}@{game['home_abbr']} (pitcher_id={pitcher_id}). "
+                f"Top-level summary keys: {list(data.keys())}"
+            )
+
+    def _find_pitch_count(self, data: Any, pitcher_id: Optional[str]) -> Optional[int]:
+        """Tries a couple of specific plausible paths first (boxscore
+        player stats keyed by name like "pitchesThrown" or "P"), then
+        falls back to a generic recursive scan of the whole response
+        for any dict that has both a player/athlete id matching
+        pitcher_id AND a key that looks like a pitch count. Best-effort:
+        returns None rather than guessing wrong if nothing matches."""
+        # Specific attempt: ESPN boxscores commonly expose player stats
+        # as parallel "labels"/"names" and "stats" (or "displayValue")
+        # arrays under boxscore.players[].statistics[].
+        try:
+            for team_block in data.get("boxscore", {}).get("players", []):
+                for stat_block in team_block.get("statistics", []):
+                    labels = stat_block.get("labels") or stat_block.get("names") or []
+                    pitch_idx = None
+                    for i, label in enumerate(labels):
+                        if str(label).strip().upper() in ("P", "PC", "PITCHES", "PITCHESTHROWN"):
+                            pitch_idx = i
+                            break
+                    if pitch_idx is None:
+                        continue
+                    for athlete_entry in stat_block.get("athletes", []):
+                        athlete = athlete_entry.get("athlete", {})
+                        if pitcher_id and str(athlete.get("id")) != pitcher_id:
+                            continue
+                        stats = athlete_entry.get("stats", [])
+                        if pitch_idx < len(stats):
+                            try:
+                                return int(str(stats[pitch_idx]).split("-")[0])
+                            except (ValueError, TypeError):
+                                continue
+        except Exception:
+            pass
+
+        # Generic fallback: recursively scan for any dict that has a
+        # pitch-count-looking key AND whose subtree also contains the
+        # pitcher's id somewhere (sibling or nested) -- not just a dict
+        # where both happen to be literally the same object, since real
+        # API shapes usually put stat values as a sibling of the
+        # athlete reference, not inside it.
+        pitch_key_names = {"pitchcount", "pitches", "pitchesthrown", "numberofpitches"}
+
+        def contains_id(node):
+            if isinstance(node, dict):
+                if pitcher_id and str(node.get("id", "")) == pitcher_id:
+                    return True
+                return any(contains_id(v) for v in node.values())
+            if isinstance(node, list):
+                return any(contains_id(item) for item in node)
+            return False
+
+        def scan(node):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    if k.lower() in pitch_key_names and isinstance(v, (int, str)):
+                        if pitcher_id is None or contains_id(node):
+                            try:
+                                return int(v)
+                            except (ValueError, TypeError):
+                                pass
+                for v in node.values():
+                    result = scan(v)
+                    if result is not None:
+                        return result
+            elif isinstance(node, list):
+                for item in node:
+                    result = scan(item)
+                    if result is not None:
+                        return result
+            return None
+
+        return scan(data)
+
+    def _fetch_future_upcoming_games(self) -> List[Dict[str, Any]]:
+        """Explicitly queries ESPN's scoreboard for each of the next
+        `upcoming_games_lookahead_days` days (via the `dates=YYYYMMDD`
+        parameter), since the default no-date-parameter call only
+        returns TODAY's games -- a favorite team's actual next game is
+        almost always tomorrow or later, not today, so relying on the
+        main scoreboard fetch alone means upcoming_games is nearly
+        always empty. This is a separate, slower-cadence fetch (see
+        upcoming_games_refresh_seconds) since schedules barely change
+        within a day, unlike scores/situations which need frequent
+        polling. One request per day queried; failures on individual
+        days are logged and skipped rather than aborting the whole
+        lookahead."""
+        if not self.show_upcoming_games:
+            return []
+
+        favorites_only = self.show_favorite_teams_only or not self.past_upcoming_all_teams
+        results = []
+        today = datetime.datetime.now()
+
+        for offset in range(1, self.upcoming_games_lookahead_days + 1):
+            day = today + datetime.timedelta(days=offset)
+            date_param = day.strftime("%Y%m%d")
+            try:
+                resp = self.session.get(ESPN_SCOREBOARD_URL, params={"dates": date_param}, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                self.logger.warning(f"Could not fetch upcoming-games lookahead for {date_param}: {e}")
+                continue
+
+            for event in data.get("events", []):
+                competitions = event.get("competitions", [])
+                if not competitions:
+                    continue
+                comp = competitions[0]
+                state = comp.get("status", {}).get("type", {}).get("state")
+                if state != "pre":
+                    continue
+                competitors = comp.get("competitors", [])
+                abbrevs = [c.get("team", {}).get("abbreviation", "").upper() for c in competitors]
+                involves_favorite = any(fav in abbrevs for fav in self.favorite_teams)
+                if involves_favorite or not favorites_only:
+                    results.append(self._parse_game(event, comp, game_type="upcoming"))
+
+        return results
 
     def _process_scoreboard(self, data: Dict[str, Any]):
         events = data.get("events", [])
         live_games = []
+        past_games = []
+        upcoming_games = []
+
+        # Strict mode (show_favorite_teams_only) always restricts
+        # past/upcoming to favorites regardless of past_upcoming_all_teams
+        # -- that toggle only matters in non-strict mode.
+        past_upcoming_favorites_only = self.show_favorite_teams_only or not self.past_upcoming_all_teams
 
         for event in events:
             competitions = event.get("competitions", [])
@@ -567,20 +1144,39 @@ class TidbytBaseballPlugin(BasePlugin):
                 continue
             comp = competitions[0]
             state = comp.get("status", {}).get("type", {}).get("state")
-            if state != "in":
-                continue
-            game = self._parse_game(event, comp)
-            if self.show_favorite_teams_only:
-                if game["away_abbr"] in self.favorite_teams or game["home_abbr"] in self.favorite_teams:
-                    live_games.append(game)
-            else:
-                live_games.append(game)
+            competitors = comp.get("competitors", [])
+            abbrevs = [c.get("team", {}).get("abbreviation", "").upper() for c in competitors]
+            involves_favorite = any(fav in abbrevs for fav in self.favorite_teams)
+
+            if state == "in":
+                # Collect ALL live games here, unfiltered -- the
+                # favorite-vs-other cascade decision (which of these
+                # actually get shown) happens in _maybe_refresh, since
+                # it needs to know whether ANY favorite is live before
+                # deciding whether to include everyone else.
+                live_games.append(self._parse_game(event, comp, game_type="live"))
+            elif state == "post" and self.show_past_games:
+                if involves_favorite or not past_upcoming_favorites_only:
+                    past_games.append(self._parse_game(event, comp, game_type="final"))
+            elif state == "pre" and self.show_upcoming_games:
+                if involves_favorite or not past_upcoming_favorites_only:
+                    upcoming_games.append(self._parse_game(event, comp, game_type="upcoming"))
+
+        past_games = past_games[: self.max_past_games]
+
+        # Explicitly requested: upcoming games shown in start-time order.
+        # Sorting by the raw ISO8601 UTC string (rather than the
+        # formatted local date_str/time_str) sorts correctly across
+        # date/month boundaries since ISO8601 sorts chronologically as
+        # a plain string comparison.
+        upcoming_games.sort(key=lambda g: g.get("event_date_raw") or "")
+        upcoming_games = upcoming_games[: self.max_upcoming_games]
 
         fallback_game = None
-        if not live_games:
+        if not live_games and not past_games and not upcoming_games:
             fallback_game = self._find_favorite_game(data)
 
-        return live_games, fallback_game
+        return live_games, past_games, upcoming_games, fallback_game
 
     def _find_favorite_game(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         events = data.get("events", [])
@@ -597,9 +1193,33 @@ class TidbytBaseballPlugin(BasePlugin):
         if not candidates:
             return None
         event, comp = candidates[0]
-        return self._parse_game(event, comp)
+        state = comp.get("status", {}).get("type", {}).get("state")
+        game_type = {"in": "live", "post": "final", "pre": "upcoming"}.get(state, "upcoming")
+        return self._parse_game(event, comp, game_type=game_type)
 
-    def _parse_game(self, event: Dict[str, Any], comp: Dict[str, Any]) -> Dict[str, Any]:
+    def _format_game_datetime(self, event: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """Parses ESPN's event.date (ISO8601 UTC, e.g.
+        "2026-07-12T23:10Z") and formats it as separate (date, time)
+        strings in the system's local timezone -- assumes the Pi's
+        system clock/timezone is set correctly, which is the normal
+        case for a home device. Returns (None, None) if the field is
+        missing or unparseable rather than crashing."""
+        raw = event.get("date")
+        if not raw:
+            return None, None
+        try:
+            iso = raw.replace("Z", "+00:00")
+            dt_utc = datetime.datetime.fromisoformat(iso)
+            dt_local = dt_utc.astimezone()
+            date_str = f"{dt_local.month}/{dt_local.day}"
+            hour_12 = dt_local.hour % 12 or 12
+            ampm = "AM" if dt_local.hour < 12 else "PM"
+            time_str = f"{hour_12}:{dt_local.minute:02d} {ampm}"
+            return date_str, time_str
+        except Exception:
+            return None, None
+
+    def _parse_game(self, event: Dict[str, Any], comp: Dict[str, Any], game_type: str = "live") -> Dict[str, Any]:
         competitors = comp.get("competitors", [])
         away = next((c for c in competitors if c.get("homeAway") == "away"), competitors[0])
         home = next((c for c in competitors if c.get("homeAway") == "home"), competitors[-1])
@@ -626,32 +1246,99 @@ class TidbytBaseballPlugin(BasePlugin):
                 return logos[0].get("href")
             return None
 
-        def extract_batter_name(situation_dict):
-            """ESPN's scoreboard payload isn't officially documented, so
-            this tries several plausible shapes for the current batter's
-            name rather than assuming one exact path. Returns None (not
-            a crash) if nothing matches -- the display just omits the
-            batter line in that case. If the actual shape turns out to
-            be something else entirely, check plugin logs for the raw
-            situation keys logged the first time this comes up empty
-            during a live game, and I can add the right path."""
+        def extract_batter_info(situation_dict):
+            """Confirmed against real live-game data (2026-07-09, ATH@DET
+            and SEA@MIA): ESPN's actual structure is
+            situation.batter.athlete.{displayName, fullName, shortName}.
+            shortName comes pre-formatted as "F. Lastname" (e.g.
+            "K. McGonigle") -- prefer that directly over reformatting
+            displayName ourselves, since ESPN's own abbreviation handles
+            edge cases (suffixes, multi-word names) more reliably than
+            a naive "first letter + rest" split would.
+
+            Falls back to a couple of alternate shapes in case ESPN
+            changes this for other games/situations, and returns
+            (full_name, short_name) with either possibly None rather
+            than crashing if the structure is missing entirely."""
             candidates = [
-                lambda s: s.get("batter", {}).get("athlete", {}).get("displayName"),
-                lambda s: s.get("batter", {}).get("athlete", {}).get("fullName"),
-                lambda s: s.get("batter", {}).get("displayName"),
-                lambda s: s.get("atBat", {}).get("athlete", {}).get("displayName"),
-                lambda s: s.get("atBat", {}).get("displayName"),
+                lambda s: s.get("batter", {}).get("athlete", {}),
+                lambda s: s.get("atBat", {}).get("athlete", {}),
             ]
             for getter in candidates:
                 try:
-                    name = getter(situation_dict)
-                    if name:
-                        return name
+                    athlete = getter(situation_dict)
+                    full = athlete.get("displayName") or athlete.get("fullName")
+                    short = athlete.get("shortName")
+                    if full or short:
+                        return full, short
+                except Exception:
+                    continue
+            return None, None
+
+        def extract_pitcher_info(situation_dict):
+            """Same shape as the batter extraction, confirmed against
+            the same real live-game data: situation.pitcher.athlete.
+            {displayName, fullName, shortName}."""
+            try:
+                athlete = situation_dict.get("pitcher", {}).get("athlete", {})
+                full = athlete.get("displayName") or athlete.get("fullName")
+                short = athlete.get("shortName")
+                return full, short
+            except Exception:
+                return None, None
+
+        def extract_pitch_count(situation_dict):
+            """NOTE: the real live-game JSON already captured for this
+            plugin shows situation.pitcher only has playerId/period/
+            athlete/projections/summary (summary being a text string
+            like "0.1 IP, 0 ER, 0 H, 0 BB") -- no explicit numeric pitch
+            count field. These candidate paths are best-effort in case
+            it appears under a different key or later in some games;
+            if none match, this returns None and the display just
+            shows the pitcher's name without a count number rather than
+            a misleading placeholder."""
+            candidates = [
+                lambda s: s.get("pitcher", {}).get("pitchCount"),
+                lambda s: s.get("pitcher", {}).get("pitches"),
+                lambda s: s.get("pitchCount"),
+            ]
+            for getter in candidates:
+                try:
+                    val = getter(situation_dict)
+                    if val is not None:
+                        return val
                 except Exception:
                     continue
             return None
 
+        def extract_last_play(situation_dict):
+            """Confirmed against the same real live-game data captured
+            earlier (ATH@DET, SEA@MIA): situation.lastPlay.{id, text,
+            type.type}. Unlike pitch count, this field IS present in
+            the lightweight scoreboard endpoint -- no extra API call
+            needed. `type.type` is a short code (seen so far: "ball",
+            "start-batterpitcher") used to filter out routine
+            pitch-by-pitch updates from actual play outcomes."""
+            try:
+                lp = situation_dict.get("lastPlay") or {}
+                play_id = lp.get("id")
+                play_text = lp.get("text")
+                play_type = (lp.get("type") or {}).get("type", "")
+                return play_id, play_text, play_type
+            except Exception:
+                return None, None, None
+
+        batter_full, batter_short = extract_batter_info(situation)
+        pitcher_full, pitcher_short = extract_pitcher_info(situation)
+        pitch_count = extract_pitch_count(situation)
+        last_play_id, last_play_text, last_play_type = extract_last_play(situation)
+        game_date_str, game_time_str = self._format_game_datetime(event)
+
         return {
+            "game_type": game_type,
+            "event_date_raw": event.get("date"),
+            "game_date_str": game_date_str,
+            "game_time_str": game_time_str,
             "state": status_type.get("state", "pre"),
             "away_abbr": away.get("team", {}).get("abbreviation", "AWY")[:3].upper(),
             "home_abbr": home.get("team", {}).get("abbreviation", "HOM")[:3].upper(),
@@ -668,7 +1355,15 @@ class TidbytBaseballPlugin(BasePlugin):
             "balls": situation.get("balls", 0),
             "strikes": situation.get("strikes", 0),
             "outs": situation.get("outs", 0),
-            "batter_name": extract_batter_name(situation),
+            "batter_name": batter_full,
+            "batter_short_name": batter_short,
+            "pitcher_name": pitcher_full,
+            "pitcher_short_name": pitcher_short,
+            "pitch_count": pitch_count,
+            "event_id": event.get("id"),
+            "last_play_id": last_play_id,
+            "last_play_text": last_play_text,
+            "last_play_type": last_play_type,
             "on_first": bool(situation.get("onFirst")),
             "on_second": bool(situation.get("onSecond")),
             "on_third": bool(situation.get("onThird")),
@@ -693,6 +1388,14 @@ class TidbytBaseballPlugin(BasePlugin):
             "strikes": 1,
             "outs": 1,
             "batter_name": "Riley Greene",
+            "batter_short_name": "R. Greene",
+            "pitcher_name": "Tarik Skubal",
+            "pitcher_short_name": "T. Skubal",
+            "pitch_count": 47,
+            "event_id": "test-event-1",
+            "last_play_id": "test-play-1",
+            "last_play_text": "Riley Greene singles to left field.",
+            "last_play_type": "single",
             "on_first": True,
             "on_second": False,
             "on_third": True,
@@ -702,17 +1405,22 @@ class TidbytBaseballPlugin(BasePlugin):
     # Rotation
     # ------------------------------------------------------------------
     def _maybe_rotate(self):
-        if len(self.live_games) <= 1:
-            return
-        now = time.time()
-        if now - self.last_switch_time >= self.game_rotation_seconds:
-            self.current_index = (self.current_index + 1) % len(self.live_games)
-            self.last_switch_time = now
+        with self._data_lock:
+            if len(self.rotation_games) <= 1:
+                return
+            now = time.time()
+            if now - self.last_switch_time >= self.game_rotation_seconds:
+                self.current_index = (self.current_index + 1) % len(self.rotation_games)
+                self.last_switch_time = now
 
     def _current_game(self) -> Optional[Dict[str, Any]]:
-        if self.live_games:
-            return self.live_games[self.current_index]
-        return self.fallback_game
+        with self._data_lock:
+            if self.rotation_games:
+                # index is guarded above/in _maybe_refresh, but clamp
+                # defensively in case rotation_games shrank between calls
+                idx = min(self.current_index, len(self.rotation_games) - 1)
+                return self.rotation_games[idx]
+            return self.fallback_game
 
     # ------------------------------------------------------------------
     # Logos
@@ -773,7 +1481,9 @@ class TidbytBaseballPlugin(BasePlugin):
     # Rendering
     # ------------------------------------------------------------------
     def display(self, force_clear: bool = False):
-        self._maybe_rotate()
+        active_flash = self._service_flash_queue()
+        if active_flash is None:
+            self._maybe_rotate()
 
         width, height = self._get_dimensions()
         image = Image.new("RGB", (width, height), (0, 0, 0))
@@ -788,53 +1498,151 @@ class TidbytBaseballPlugin(BasePlugin):
         left_w = width // 2
         col_w = left_w // 2
 
-        draw.rectangle([0, 0, col_w - 1, height - 1], fill=game["away_color"])
-        draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=game["home_color"])
+        game_type = game.get("game_type", "live")
 
-        away_txt_color = self._text_color_for(game["away_color"])
-        home_txt_color = self._text_color_for(game["home_color"])
+        try:
+            if game_type == "final":
+                self._render_final_game(image, draw, game, width, height)
+                self._push_image(image, force_clear)
+                return
+            elif game_type == "upcoming":
+                self._render_upcoming_game(image, draw, game, width, height)
+                self._push_image(image, force_clear)
+                return
 
-        # Both columns must render at the SAME font size, or a team with
-        # a longer score (e.g. "DET 12" vs "ATH 2") would shrink more to
-        # fit and visibly look smaller than the other -- that's the bug
-        # that made one team's text look bigger than the other's.
-        away_text = f"{game['away_abbr']} {game['away_score']}"
-        home_text = f"{game['home_abbr']} {game['home_score']}"
-        available_text_width = col_w - 4
-        shared_font = self._fit_font_for_pair(draw, away_text, home_text, available_text_width, start_size=10)
+            # Swapped per request: the darker shade now sits behind the
+            # logo (better contrast so light/white logo elements don't
+            # wash out against a bright saturated color), and the full
+            # bright team color moves to the text bar instead.
+            draw.rectangle([0, 0, col_w - 1, height - 1], fill=self._darken_color(game["away_color"]))
+            draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=self._darken_color(game["home_color"]))
 
-        self._draw_team_column(image, draw, 0, 0, col_w, height,
-                                game["away_abbr"], game["away_score"], game.get("away_logo"),
-                                away_txt_color, game["away_color"], shared_font)
-        self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
-                                game["home_abbr"], game["home_score"], game.get("home_logo"),
-                                home_txt_color, game["home_color"], shared_font)
+            away_txt_color = self._text_color_for(game["away_color"])
+            home_txt_color = self._text_color_for(game["home_color"])
 
-        right_x0 = left_w + 2
-        right_w = width - right_x0 - 1
+            # Both columns must render at the SAME font size, or a team with
+            # a longer score (e.g. "DET 12" vs "ATH 2") would shrink more to
+            # fit and visibly look smaller than the other -- that's the bug
+            # that made one team's text look bigger than the other's.
+            away_text = f"{game['away_abbr']} {game['away_score']}"
+            home_text = f"{game['home_abbr']} {game['home_score']}"
+            available_text_width = col_w - 4
+            shared_font = self._fit_font_for_pair(draw, away_text, home_text, available_text_width, start_size=10)
 
-        top_margin = 2  # keeps inning triangle/number and outs off the physical top edge
-        self._draw_inning(image, right_x0 + 1, top_margin, game)
-        self._draw_outs(draw, right_x0, top_margin, right_w, game)
+            self._draw_team_column(image, draw, 0, 0, col_w, height,
+                                    game["away_abbr"], game["away_score"], game.get("away_logo"),
+                                    away_txt_color, game["away_color"], shared_font)
+            self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
+                                    game["home_abbr"], game["home_score"], game.get("home_logo"),
+                                    home_txt_color, game["home_color"], shared_font)
 
-        inning_tri_size = 6
-        top_row_bottom = top_margin + inning_tri_size
-        lower_y = height - 6  # bottom-row text measures ~5px tall, so this is measured, not padded
-        diamond_y = top_row_bottom
-        diamond_available_h = (lower_y - 2) - diamond_y  # leave a clear gap before the bottom row
-        diamond_w = int(right_w * 0.5)
-        diamond_x = right_x0 + (right_w - diamond_w) // 2
-        self._draw_diamond(draw, diamond_x, diamond_y, diamond_w, diamond_available_h, game)
+            draw.rectangle([left_w, 0, left_w, height - 1], fill=(166, 166, 166))
 
-        count_text = f"{game['balls']}-{game['strikes']}"
-        self._draw_count(image, right_x0 + 1, lower_y, game)
+            right_x0 = left_w + 2
+            right_w = width - right_x0 - 1
 
-        if self.show_batter_name:
-            count_bbox = self._measure(self.font_count, count_text)
-            count_w = count_bbox[2] - count_bbox[0]
-            batter_x = right_x0 + 1 + count_w + 4
-            batter_max_w = (right_x0 + right_w) - batter_x
-            self._draw_batter(image, draw, batter_x, lower_y, batter_max_w, game.get("batter_name"))
+            event_id = game.get("event_id")
+            show_flash = active_flash is not None and event_id == active_flash["event_id"]
+
+            if show_flash:
+                play_type = (game.get("last_play_type") or "").lower()
+                if play_type in HOME_RUN_PLAY_TYPES:
+                    elapsed = time.time() - active_flash["started_at"]
+                    batting_color = game["away_color"] if game["inning_half"] else game["home_color"]
+                    self._draw_home_run_animation(
+                        image, draw, right_x0, 0, right_w, height,
+                        game.get("last_play_text") or "", elapsed, active_flash["duration"],
+                        batting_color, seed=event_id or "hr",
+                    )
+                else:
+                    self._draw_last_play(
+                        image, draw, right_x0, 0, right_w, height,
+                        game.get("last_play_text") or "", fill=(255, 255, 255),
+                    )
+            else:
+                top_margin = 1
+                lower_y = height - 6  # bottom-row (count/batter) text measures ~5px tall
+
+                # --- Top row: pitch count + pitcher name, in the space
+                #     freed up by moving inning/outs down next to the diamond ---
+                # IMPORTANT: reserve a FIXED height here regardless of what
+                # _draw_pitch_info actually returns. Using the real returned
+                # height would make diamond_y (and therefore the diamond's
+                # whole size) depend on whether THIS PARTICULAR game has
+                # pitcher data -- which is exactly why the bases looked a
+                # different size between games as the display cycled: some
+                # games had a pitcher name (row ~6px tall) and others didn't
+                # (row 0px tall), so the diamond got more or less vertical
+                # room each time. A fixed reservation keeps geometry
+                # identical across every game regardless of its data.
+                pitch_row_reserved_h = 6
+                has_batter = bool(game.get("batter_name") or game.get("batter_short_name"))
+                has_pitcher = bool(game.get("pitcher_name") or game.get("pitcher_short_name"))
+                if not has_batter and not has_pitcher:
+                    # Mid-inning gap in ESPN's data (between at-bats, after
+                    # a play, etc.) -- show who's due up next instead of
+                    # leaving this row blank.
+                    batting_team = game["away_abbr"] if game["inning_half"] else game["home_abbr"]
+                    self._draw_due_up(image, draw, right_x0 + 1, top_margin, right_w - 2, batting_team)
+                else:
+                    self._draw_pitch_info(
+                        image, draw, right_x0 + 1, top_margin, right_w - 2,
+                        game.get("pitch_count"), game.get("pitcher_name"), game.get("pitcher_short_name"),
+                    )
+
+                # --- Middle: diamond centered, inning (left) and outs
+                #     (right) vertically centered against it ---
+                # Reserve real horizontal space for inning/outs first (measuring
+                # actual glyph width, not guessing), THEN size the diamond to
+                # fit exactly what's left -- this is what guarantees no overlap,
+                # rather than assuming a fixed diamond width and hoping it fits.
+                diamond_y = top_margin + pitch_row_reserved_h + 1
+                diamond_available_h = (lower_y - 2) - diamond_y
+
+                inning_tri_size = 6
+                sample_bbox = self._measure(self.font_tiny, "12")  # worst-case 2-digit inning
+                inning_number_w = sample_bbox[2] - sample_bbox[0]
+                inning_reserved_w = inning_tri_size + 3 + inning_number_w + 2
+
+                outs_size = 4
+                outs_reserved_w = outs_size + 2 + 3
+
+                available_diamond_w = right_w - inning_reserved_w - outs_reserved_w
+                diamond_w = max(min(int(right_w * 0.5), available_diamond_w), 16)
+                diamond_x = right_x0 + inning_reserved_w
+
+                self._draw_diamond(draw, diamond_x, diamond_y, diamond_w, diamond_available_h, game)
+                geo = self._diamond_geometry(diamond_x, diamond_y, diamond_w, diamond_available_h)
+
+                inning_y = geo["center_y"] - inning_tri_size // 2
+                self._draw_inning(image, right_x0 + 1, inning_y, game)
+
+                outs_cx = right_x0 + right_w - 3 - outs_size // 2
+                self._draw_outs(draw, outs_cx, geo["center_y"], game, size=outs_size, gap=1)
+
+                # --- Bottom row: batter left-aligned (matching inning/
+                #     pitch-count's left edge above), count right-aligned
+                #     in the bottom-right corner ---
+                count_text = f"{game['balls']}-{game['strikes']}"
+                count_bbox = self._measure(self.font_count, count_text)
+                count_w = count_bbox[2] - count_bbox[0]
+                count_x = (right_x0 + right_w) - count_w - 2
+                self._draw_count(image, count_x, lower_y, game)
+
+                if self.show_batter_name:
+                    batter_x = right_x0 + 1
+                    batter_max_w = count_x - 2 - batter_x
+                    self._draw_batter(image, draw, batter_x, lower_y, batter_max_w, game.get("batter_name"), game.get("batter_short_name"))
+        except Exception as e:
+            # Same reasoning as the try/except added around update()'s
+            # parsing: a rendering bug triggered by one unusual game
+            # state (e.g. a field temporarily missing mid-play) should
+            # degrade to a blank/simple frame, not propagate an
+            # exception out of display() -- which could have the same
+            # "everything freezes" effect this whole investigation started from.
+            self.logger.error(f"Error rendering game display, showing blank frame instead: {e}", exc_info=True)
+            image = Image.new("RGB", (width, height), (0, 0, 0))
+            self._render_text(image, (4, height // 2 - 4), "Render Err", self.font_small, (200, 60, 60))
 
         self._push_image(image, force_clear)
 
@@ -853,6 +1661,100 @@ class TidbytBaseballPlugin(BasePlugin):
                 return int(w), int(h)
         return 128, 32
 
+    def _render_final_game(self, image, draw, game, width, height):
+        """Completed game: normal team columns, but the WINNING team's
+        bar is highlighted yellow instead of its usual team color, and
+        the black half just shows "FINAL" centered -- no diamond/
+        inning/etc, since there's no live situation to show."""
+        left_w = width // 2
+        col_w = left_w // 2
+
+        draw.rectangle([0, 0, col_w - 1, height - 1], fill=self._darken_color(game["away_color"]))
+        draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=self._darken_color(game["home_color"]))
+
+        away_text = f"{game['away_abbr']} {game['away_score']}"
+        home_text = f"{game['home_abbr']} {game['home_score']}"
+        available_text_width = col_w - 4
+        shared_font = self._fit_font_for_pair(draw, away_text, home_text, available_text_width, start_size=10)
+
+        yellow = (255, 200, 0)
+        away_won = game["away_score"] > game["home_score"]
+        home_won = game["home_score"] > game["away_score"]
+
+        away_txt_color = self._text_color_for(yellow) if away_won else self._text_color_for(game["away_color"])
+        home_txt_color = self._text_color_for(yellow) if home_won else self._text_color_for(game["home_color"])
+
+        self._draw_team_column(image, draw, 0, 0, col_w, height,
+                                game["away_abbr"], game["away_score"], game.get("away_logo"),
+                                away_txt_color, game["away_color"], shared_font,
+                                bar_color_override=yellow if away_won else None)
+        self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
+                                game["home_abbr"], game["home_score"], game.get("home_logo"),
+                                home_txt_color, game["home_color"], shared_font,
+                                bar_color_override=yellow if home_won else None)
+
+        draw.rectangle([left_w, 0, left_w, height - 1], fill=(166, 166, 166))
+
+        right_x0 = left_w + 2
+        right_w = width - right_x0 - 1
+        font = self._load_font(10, bold=True)
+        text = "FINAL"
+        bbox = self._measure(font, text)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        tx = right_x0 + max((right_w - tw) // 2, 0)
+        ty = max((height - th) // 2, 0) - bbox[1]
+        self._render_text(image, (tx, ty), text, font, (255, 255, 255))
+
+    def _render_upcoming_game(self, image, draw, game, width, height):
+        """Scheduled game that hasn't started: team columns show only
+        the abbreviation (no score -- there isn't one yet), and the
+        black half shows "UPCOMING" with the game's date and start time
+        (in local system time) below it."""
+        left_w = width // 2
+        col_w = left_w // 2
+
+        draw.rectangle([0, 0, col_w - 1, height - 1], fill=self._darken_color(game["away_color"]))
+        draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=self._darken_color(game["home_color"]))
+
+        away_txt_color = self._text_color_for(game["away_color"])
+        home_txt_color = self._text_color_for(game["home_color"])
+
+        available_text_width = col_w - 4
+        shared_font = self._fit_font_for_pair(draw, game["away_abbr"], game["home_abbr"], available_text_width, start_size=10)
+
+        self._draw_team_column(image, draw, 0, 0, col_w, height,
+                                game["away_abbr"], game["away_score"], game.get("away_logo"),
+                                away_txt_color, game["away_color"], shared_font, show_score=False)
+        self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
+                                game["home_abbr"], game["home_score"], game.get("home_logo"),
+                                home_txt_color, game["home_color"], shared_font, show_score=False)
+
+        draw.rectangle([left_w, 0, left_w, height - 1], fill=(166, 166, 166))
+
+        right_x0 = left_w + 2
+        right_w = width - right_x0 - 1
+
+        title_font = self._load_font(8, bold=True)
+        title = "UPCOMING"
+        tbbox = self._measure(title_font, title)
+        tw = tbbox[2] - tbbox[0]
+        tx = right_x0 + max((right_w - tw) // 2, 0)
+        ty = 2 - tbbox[1]
+        self._render_text(image, (tx, ty), title, title_font, (255, 255, 255))
+
+        info_font = self._load_font(7, bold=False)
+        date_str = game.get("game_date_str")
+        time_str = game.get("game_time_str")
+        cursor_y = ty + (tbbox[3] - tbbox[1]) + 4
+
+        for line in filter(None, [date_str, time_str]):
+            lbbox = self._measure(info_font, line)
+            lw = lbbox[2] - lbbox[0]
+            lx = right_x0 + max((right_w - lw) // 2, 0)
+            ly = cursor_y - lbbox[1]
+            self._render_text(image, (lx, ly), line, info_font, (200, 200, 200))
+            cursor_y += (lbbox[3] - lbbox[1]) + 2
+
     def _push_image(self, image: Image.Image, force_clear: bool):
         dm = self.display_manager
         if hasattr(dm, "image") and hasattr(dm, "update_display"):
@@ -867,6 +1769,10 @@ class TidbytBaseballPlugin(BasePlugin):
             "`.set_image()`. Check your LEDMatrix DisplayManager API and "
             "adjust TidbytBaseballPlugin._push_image() to match."
         )
+
+    @staticmethod
+    def _darken_color(color: Tuple[int, int, int], min_channel: int = 15) -> Tuple[int, int, int]:
+        return tuple(max(c // 2, min_channel) for c in color)
 
     @staticmethod
     def _text_color_for(bg: Tuple[int, int, int]) -> Tuple[int, int, int]:
@@ -897,13 +1803,19 @@ class TidbytBaseballPlugin(BasePlugin):
 
 
 
-    def _draw_team_column(self, image, draw, x0, y0, w, h, abbr, score, logo, text_color, bg_color, font):
+    def _draw_team_column(self, image, draw, x0, y0, w, h, abbr, score, logo, text_color, bg_color, font,
+                          bar_color_override=None, show_score=True):
         """Logo fills nearly the whole column (as large as the panel
         allows); a darkened bar across the bottom holds the bold
         'ABBR SCORE' text so it stays legible over the logo. `font` is
         computed once by the caller from BOTH columns' text, so the two
-        teams always render at the same size."""
-        text_line = f"{abbr} {score}"
+        teams always render at the same size.
+
+        `bar_color_override`: used for final (completed) games to
+        highlight the winning team's bar in yellow instead of its
+        normal team color. `show_score`: set False for upcoming games,
+        which don't have a score yet -- shows just the abbreviation."""
+        text_line = f"{abbr} {score}" if show_score else abbr
         line_bbox = self._measure(font, text_line)
         line_h = line_bbox[3] - line_bbox[1]
         line_w = line_bbox[2] - line_bbox[0]
@@ -919,13 +1831,32 @@ class TidbytBaseballPlugin(BasePlugin):
             image.paste(logo, (logo_x, logo_y), logo)
 
         bar_y0 = y0 + h - bar_h
-        bar_color = tuple(max(c // 2, 15) for c in bg_color)
+        bar_color = bar_color_override if bar_color_override is not None else bg_color
         draw.rectangle([x0, bar_y0, x0 + w - 1, y0 + h - 1], fill=bar_color)
 
         tx = x0 + max((w - line_w) // 2, 0)
         tx = min(tx, x0 + w - line_w) if line_w < w else x0
         ty = bar_y0 + max((bar_h - line_h) // 2, 0) - line_bbox[1]
         self._render_text(image, (tx, ty), text_line, font, text_color)
+
+    def _diamond_geometry(self, x, y, w, h):
+        """Single source of truth for the diamond's size/position math,
+        shared between _draw_diamond (drawing it) and display() (which
+        needs to know its actual center to align the inning/outs
+        indicators next to it)."""
+        cx = x + w // 2
+        max_half_by_height = max((h - 2) // 3, 3)
+        max_half_by_width = max((w - 6) // 2, 3)
+        half = max(min(max_half_by_height, max_half_by_width), 3)
+        top_y = y + half + 1
+        bottom_y = top_y + half + 2
+        left_x = cx - half - 3 - half   # leftmost point (third base tip)
+        right_x = cx + half + 3 + half  # rightmost point (first base tip)
+        center_y = (top_y + bottom_y) // 2
+        return {
+            "cx": cx, "half": half, "top_y": top_y, "bottom_y": bottom_y,
+            "left_x": left_x, "right_x": right_x, "center_y": center_y,
+        }
 
     def _draw_diamond(self, draw, x, y, w, h, game):
         """`h` is the actual vertical space available for the whole
@@ -939,13 +1870,8 @@ class TidbytBaseballPlugin(BasePlugin):
         unoccupied-base outline is an exact 1px line -- running it
         through the supersample/downsample anti-aliasing helper was
         blurring that 1px line into something that reads as thicker."""
-        cx = x + w // 2
-        max_half_by_height = max((h - 2) // 3, 3)
-        max_half_by_width = max((w - 6) // 2, 3)
-        half = max(min(max_half_by_height, max_half_by_width), 3)
-
-        top_y = y + half + 1
-        bottom_y = top_y + half + 2
+        geo = self._diamond_geometry(x, y, w, h)
+        cx, half, top_y, bottom_y = geo["cx"], geo["half"], geo["top_y"], geo["bottom_y"]
 
         positions = {
             "second": (cx, top_y),
@@ -1003,30 +1929,386 @@ class TidbytBaseballPlugin(BasePlugin):
         count_text = f"{game['balls']}-{game['strikes']}"
         self._render_text(image, (x, y), count_text, self.font_count, (255, 200, 0))
 
-    def _draw_batter(self, image, draw, x, y, max_width, batter_name):
-        """Draws 'F. Lastname' for whoever is currently at bat, shrunk
-        to fit whatever width remains next to the count. Skips silently
-        (no placeholder text) if ESPN didn't provide a batter name --
-        see the comment in _parse_game.extract_batter_name for how to
-        fix that if it turns out ESPN's field is named something else."""
-        if not batter_name or max_width <= 0:
-            return
-        formatted = self._format_batter_name(batter_name)
-        font = self._fit_font_for_width(draw, formatted, max_width, start_size=7, min_size=4)
-        bbox = self._measure(font, formatted)
-        if bbox[2] - bbox[0] > max_width:
-            return  # still doesn't fit even at the smallest size -- skip rather than overflow
-        self._render_text(image, (x, y), formatted, font, (200, 200, 200))
-
-    def _draw_outs(self, draw, x, y, w, game):
-        square = 3
-        gap = 2
-        edge_margin = 3
-        base_x = x + w - edge_margin - (square + gap) * 3 + gap
-        for i in range(3):
-            sx = base_x + i * (square + gap)
-            box = [sx, y + 1, sx + square, y + 1 + square]
-            if i < game["outs"]:
-                draw.rectangle(box, fill=self.out_fill_color)
+    def _wrap_text_lines(self, font, text: str, max_width: int) -> List[str]:
+        """Greedy word-wrap: fits as many words per line as possible
+        within max_width, wrapping to a new line when the next word
+        would overflow."""
+        words = text.split()
+        if not words:
+            return []
+        lines = []
+        current = words[0]
+        for word in words[1:]:
+            trial = f"{current} {word}"
+            bbox = self._measure(font, trial)
+            if bbox[2] - bbox[0] <= max_width:
+                current = trial
             else:
-                draw.rectangle(box, outline=self.out_empty_color)
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
+
+    def _draw_home_run_animation(self, image, draw, x0, y0, w, h, play_text: str,
+                                  elapsed: float, duration: float, team_color, seed: str):
+        """Three-phase home run animation, sequenced within the total
+        flash duration:
+          1. Ball arc -- a small ball traces a parabolic path across
+             the box and exits, representing the moment of contact.
+          2. Strobing flash -- background alternates black/team-color
+             with bold "HOME RUN!" text, an immediate high-contrast hit.
+          3. Firework bursts + play text -- settles into a calmer black
+             background with recurring particle bursts and the actual
+             play description wrapped below "HOME RUN!".
+
+        Phase lengths scale proportionally to `duration` (clamped to
+        sensible min/max) so this still looks reasonable whether
+        last_play_display_seconds is short or long."""
+        phase1_len = max(min(duration * 0.25, 1.5), 0.6)
+        phase2_len = max(min(duration * 0.20, 1.2), 0.5)
+        phase3_start = phase1_len + phase2_len
+
+        if elapsed < phase1_len:
+            draw.rectangle([x0, y0, x0 + w - 1, y0 + h - 1], fill=(0, 0, 0))
+            self._draw_ball_arc(image, x0, y0, w, h, elapsed / phase1_len)
+        elif elapsed < phase3_start:
+            self._draw_strobe_flash(image, draw, x0, y0, w, h, elapsed - phase1_len, team_color)
+        else:
+            self._draw_fireworks_with_text(image, draw, x0, y0, w, h, elapsed - phase3_start, play_text, seed)
+
+    def _draw_ball_arc(self, image, x0, y0, w, h, progress: float):
+        """Traces a small ball along a parabolic arc from the left
+        edge, peaking in the middle, exiting past the right edge --
+        with a short fading trail behind it."""
+        progress = max(0.0, min(1.0, progress))
+        trail_len = 5
+        for i in range(trail_len, 0, -1):
+            p = progress - i * 0.025
+            if p < 0:
+                continue
+            bx = x0 + int(p * (w + 6)) - 3
+            by = y0 + (h - 2) - int((h - 4) * (1 - (2 * p - 1) ** 2))
+            fade = max(0, 200 - i * 45)
+            if 0 <= bx < image.width and 0 <= by < image.height:
+                image.putpixel((bx, by), (fade, fade, 0))
+
+        bx = x0 + int(progress * (w + 6)) - 3
+        by = y0 + (h - 2) - int((h - 4) * (1 - (2 * progress - 1) ** 2))
+        draw = ImageDraw.Draw(image)
+        if x0 - 2 <= bx <= x0 + w + 2 and y0 - 2 <= by <= y0 + h + 2:
+            draw.ellipse([bx - 1, by - 1, bx + 1, by + 1], fill=(255, 255, 255))
+
+    def _draw_strobe_flash(self, image, draw, x0, y0, w, h, t: float, team_color):
+        """Alternates the whole box between black and the batting
+        team's color a few times per second, with bold white/gold
+        'HOME RUN!' text staying steady on top."""
+        strobe_on = int(t * 4) % 2 == 0
+        bg = team_color if strobe_on else (0, 0, 0)
+        draw.rectangle([x0, y0, x0 + w - 1, y0 + h - 1], fill=bg)
+
+        text_color = (255, 255, 255) if strobe_on else (255, 215, 0)
+        font = self._load_font(9, bold=True)
+        text = "HOME RUN!"
+        bbox = self._measure(font, text)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        tx = x0 + max((w - tw) // 2, 0)
+        ty = y0 + max((h - th) // 2, 0)
+        self._render_text(image, (tx, ty), text, font, text_color)
+
+    def _draw_fireworks(self, image, x0, y0, w, h, t: float, seed: str,
+                         num_bursts: int = 2, particles_per_burst: int = 8, burst_period: float = 0.9):
+        """A couple of recurring particle bursts radiating outward from
+        random (but seed-fixed, so consistent across frames of the same
+        flash) center points, fading out and looping every burst_period
+        seconds for continued visual interest through the settled phase."""
+        rng = random.Random(seed)
+        colors = [(255, 90, 0), (255, 215, 0), (255, 255, 255), (80, 180, 255)]
+        for b in range(num_bursts):
+            center_x = x0 + rng.randint(int(w * 0.2), int(w * 0.8))
+            center_y = y0 + rng.randint(int(h * 0.15), int(h * 0.6))
+            color = colors[rng.randint(0, len(colors) - 1)]
+            offset = rng.uniform(0, burst_period)
+            cycle_t = (t + offset) % burst_period
+            fade = max(0.0, 1.0 - cycle_t / (burst_period * 0.85))
+            if fade <= 0:
+                continue
+            for p in range(particles_per_burst):
+                angle = (2 * math.pi * p / particles_per_burst) + b
+                speed = 5 + (p % 3) * 2
+                dist = speed * cycle_t
+                px = int(center_x + dist * math.cos(angle))
+                py = int(center_y + dist * math.sin(angle) * 0.7)  # slightly flattened, more natural at this aspect ratio
+                if x0 <= px < x0 + w and y0 <= py < y0 + h:
+                    c = tuple(max(int(ch * fade), 0) for ch in color)
+                    image.putpixel((px, py), c)
+
+    def _draw_scrolling_text(self, image, x0, y0, w, h, text: str, font, fill, t: float,
+                              speed_px_per_sec: float = 18.0, gap: int = 16):
+        """Draws `text` on a single line, vertically centered. If it
+        fits within `w` as-is, it's just centered and static -- no
+        need to scroll short text. If it's wider than the box, it
+        scrolls continuously leftward (looping) based on elapsed time
+        `t`, so long play descriptions are never cut off, just take a
+        few seconds to fully read.
+
+        Renders onto a scratch canvas exactly the size of the box, then
+        pastes that onto the real image -- this is what guarantees the
+        scrolling text can never bleed outside its box (e.g. into the
+        team panels on the left) regardless of how far negative the
+        scroll offset gets or which font backend is active. PIL's
+        draw.text() only clips to the full target image's bounds, not
+        to an arbitrary sub-region, so without this a wide negative
+        offset could draw well outside the intended box."""
+        if not text or w <= 0 or h <= 0:
+            return
+        bbox = self._measure(font, text)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        scratch = Image.new("RGB", (w, h), (0, 0, 0))
+        ty = max((h - th) // 2, 0) - bbox[1]
+
+        if tw <= w:
+            tx = max((w - tw) // 2, 0)
+            self._render_text(scratch, (tx, ty), text, font, fill)
+        else:
+            loop_dist = w + tw + gap
+            progress = (t * speed_px_per_sec) % loop_dist
+            tx = int(round(w - progress))
+            self._render_text(scratch, (tx, ty), text, font, fill)
+
+        image.paste(scratch, (x0, y0))
+
+    def _draw_fireworks_with_text(self, image, draw, x0, y0, w, h, t: float, play_text: str, seed: str):
+        """Settled celebration phase: black background, recurring
+        firework bursts confined to the upper portion, 'HOME RUN!'
+        steady beneath them, and the actual play description scrolling
+        along the bottom -- scrolling rather than the wrap/shrink/
+        truncate approach used elsewhere, since this row only has
+        room for a single line and a long description would otherwise
+        get cut off or shrunk to near-illegibility."""
+        draw.rectangle([x0, y0, x0 + w - 1, y0 + h - 1], fill=(0, 0, 0))
+
+        fireworks_h = int(h * 0.55)
+        self._draw_fireworks(image, x0, y0, w, fireworks_h, t, seed)
+
+        font = self._load_font(7, bold=True)
+        title = "HOME RUN!"
+        tbbox = self._measure(font, title)
+        tw = tbbox[2] - tbbox[0]
+        tx = x0 + max((w - tw) // 2, 0)
+        ty = y0 + fireworks_h
+        self._render_text(image, (tx, ty), title, font, (255, 215, 0))
+
+        if play_text:
+            desc_y0 = ty + (tbbox[3] - tbbox[1]) + 2
+            desc_h = max(h - (desc_y0 - y0), 0)
+            if desc_h > 4:
+                desc_font = self._load_font(7, bold=False)
+                self._draw_scrolling_text(image, x0, desc_y0, w, desc_h, play_text, desc_font, (200, 200, 200), t)
+
+    def _draw_last_play(self, image, draw, x0, y0, w, h, text: str, fill=(255, 255, 255)):
+        """Word-wraps `text` (a full play description, e.g. "Aaron
+        Judge homers to right field, 2 RBI") across as many lines as
+        fit in the box, picking the largest font size that lets it fit
+        both width- and height-wise. Falls back to the smallest size
+        with truncated lines (ellipsis on the last visible line) if
+        even that doesn't fully fit -- rare, but better than silently
+        cutting off mid-sentence with no indication."""
+        if not text:
+            return
+
+        max_text_width = w - 4
+        best_font = None
+        best_lines = None
+        for size in range(9, 4, -1):
+            font = self._load_font(size, bold=True)
+            lines = self._wrap_text_lines(font, text, max_text_width)
+            line_bbox = self._measure(font, "Ag")
+            line_h = (line_bbox[3] - line_bbox[1]) + 2
+            total_h = line_h * len(lines)
+            all_fit_width = all(self._measure(font, ln)[2] - self._measure(font, ln)[0] <= max_text_width for ln in lines)
+            if total_h <= h and all_fit_width:
+                best_font, best_lines = font, lines
+                break
+
+        if best_font is None:
+            font = self._load_font(5, bold=True)
+            lines = self._wrap_text_lines(font, text, max_text_width)
+            line_bbox = self._measure(font, "Ag")
+            line_h = (line_bbox[3] - line_bbox[1]) + 2
+            max_lines = max(h // line_h, 1)
+            if len(lines) > max_lines:
+                lines = lines[:max_lines]
+                lines[-1] = lines[-1].rstrip() + "..."
+            best_font, best_lines = font, lines
+
+        line_bbox = self._measure(best_font, "Ag")
+        line_h = (line_bbox[3] - line_bbox[1]) + 2
+        total_h = line_h * len(best_lines)
+        start_y = y0 + max((h - total_h) // 2, 0)
+        for i, line in enumerate(best_lines):
+            lbbox = self._measure(best_font, line)
+            line_w = lbbox[2] - lbbox[0]
+            lx = x0 + max((w - line_w) // 2, 0)
+            self._render_text(image, (lx, start_y + i * line_h), line, best_font, fill)
+
+    def _draw_due_up(self, image, draw, x, y, max_width, team_abbr):
+        """Shows "TEAM DUE UP" in red, in the same spot pitch count/
+        pitcher name normally occupies, for when ESPN's data has a gap
+        between at-bats (no current batter or pitcher listed).
+        `team_abbr` is whichever team is currently batting, derived
+        from inning_half by the caller."""
+        text = f"{team_abbr} DUE UP"
+        font = self._fit_font_for_width(draw, text, max_width, start_size=7, min_size=4)
+        bbox = self._measure(font, text)
+        text_to_draw = text
+        if bbox[2] - bbox[0] > max_width:
+            truncated = text
+            text_to_draw = None
+            while truncated:
+                candidate = truncated + "."
+                cbbox = self._measure(font, candidate)
+                if cbbox[2] - cbbox[0] <= max_width:
+                    text_to_draw = candidate
+                    break
+                truncated = truncated[:-1]
+            if text_to_draw is None:
+                return
+        self._render_text(image, (x, y), text_to_draw, font, (255, 60, 0))
+
+    def _draw_pitch_line(self, image, xy, font, fill, pitch_count, name, ink_gap: int = 1) -> int:
+        """Draws 'P:<count> <name>' (or just name, if no count) with
+        the P-colon gap and the name's initial-period gap both
+        tightened. Single source of truth used for both measuring
+        (via a scratch canvas) and final rendering, so they can never
+        drift apart -- that drift (measuring untightened width, then
+        only tightening if nothing needed truncating) was the actual
+        bug: any name long enough to need truncation skipped tightening
+        entirely, which is backwards since those are exactly the names
+        that benefit from it most."""
+        x, y = xy
+        cursor = x
+        if pitch_count is not None:
+            w = self._draw_tight_join(image, cursor, y, font, fill, "P", ":", ink_gap=ink_gap)
+            cursor += w + 2
+            count_str = str(pitch_count)
+            self._render_text(image, (cursor, y), count_str, font, fill)
+            count_bbox = self._measure(font, count_str)
+            cursor += (count_bbox[2] - count_bbox[0]) + 3
+        name_w = self._draw_name_tightened(image, (cursor, y), font, fill, name, ink_gap=ink_gap)
+        cursor += name_w
+        return cursor - x
+
+    def _measure_pitch_line(self, font, pitch_count, name, ink_gap: int = 1) -> int:
+        """Width _draw_pitch_line would actually use, without touching
+        the real image."""
+        scratch = Image.new("RGB", (400, 30), (0, 0, 0))
+        return self._draw_pitch_line(scratch, (2, 2), font, (255, 255, 255), pitch_count, name, ink_gap=ink_gap)
+
+    def _draw_pitch_info(self, image, draw, x, y, max_width, pitch_count, pitcher_name, pitcher_short_name):
+        """Draws 'P:<count> <Pitcher Name>' at the top of the black
+        half. Returns the pixel height actually used, so the caller can
+        position the diamond right below it regardless of font metrics.
+
+        IMPORTANT CAVEAT: real live-game data already captured for this
+        plugin shows ESPN's scoreboard situation.pitcher object doesn't
+        appear to include a pitch-count field at all (see
+        extract_pitch_count's docstring in _parse_game). If pitch_count
+        never populates for you, that's most likely ESPN's lightweight
+        scoreboard endpoint simply not exposing it.
+
+        If the full name doesn't fit even at the smallest font size,
+        truncates the NAME specifically (never the "P:<count>" prefix)
+        character-by-character with a trailing "." -- using the same
+        tightened-width measurement throughout, so tightening is never
+        silently skipped the way it was before.
+
+        If there's no pitcher name at all, draws nothing and returns 0
+        so the diamond simply moves up to fill the freed space."""
+        if not pitcher_name and not pitcher_short_name:
+            return 0
+
+        name = pitcher_short_name or self._format_batter_name(pitcher_name)
+        color = (180, 180, 220)
+        sizing_text = f"P:{pitch_count} {name}" if pitch_count is not None else name
+        font = self._fit_font_for_width(draw, sizing_text, max_width, start_size=7, min_size=4)
+
+        candidate_name = name
+        final_name = None
+        while candidate_name:
+            trial = candidate_name if candidate_name == name else candidate_name + "."
+            width = self._measure_pitch_line(font, pitch_count, trial, ink_gap=1)
+            if width <= max_width:
+                final_name = trial
+                break
+            candidate_name = candidate_name[:-1]
+
+        if final_name is None:
+            return 0
+
+        used_w = self._draw_pitch_line(image, (x, y), font, color, pitch_count, final_name, ink_gap=1)
+        bbox = self._measure(font, final_name)
+        return bbox[3] - bbox[1]
+
+    def _draw_batter(self, image, draw, x, y, max_width, batter_name, batter_short_name=None):
+        """Draws whoever is currently at bat, shrunk to fit whatever
+        width remains next to the count.
+
+        Prefers ESPN's own pre-formatted `shortName` field (e.g.
+        "K. McGonigle") over reformatting `displayName` ourselves --
+        confirmed via real live-game data that ESPN already provides
+        this, and it's more reliable for edge cases (suffixes,
+        multi-word names) than a naive "first letter + rest" split.
+        Falls back to our own `_format_batter_name` if shortName wasn't
+        available for some reason.
+
+        Truncation decisions and the final render both use
+        `_measure_name_tightened`/`_draw_name_tightened` -- the SAME
+        tightened-width calculation throughout. Previously, truncation
+        was decided using the untightened width, then tightening was
+        only applied if no truncation happened at all -- so any name
+        long enough to need truncation (common, not rare) silently
+        skipped tightening entirely, which is backwards: those are
+        exactly the names that benefit from it most."""
+        if (not batter_name and not batter_short_name) or max_width <= 0:
+            return
+        formatted = batter_short_name or self._format_batter_name(batter_name)
+        font = self._fit_font_for_width(draw, formatted, max_width, start_size=7, min_size=4)
+
+        candidate = formatted
+        while candidate:
+            trial = candidate if candidate == formatted else candidate + "."
+            width = self._measure_name_tightened(font, trial, ink_gap=1)
+            if width <= max_width:
+                text_to_draw = trial
+                break
+            candidate = candidate[:-1]
+        else:
+            return  # nothing fits, not even a single truncated character
+
+        self._draw_name_tightened(image, (x, y), font, (200, 200, 200), text_to_draw, ink_gap=1)
+
+    def _draw_outs(self, draw, cx, center_y, game, size=3, gap=1):
+        """Vertically stacked circles (top to bottom = out 1, 2, 3),
+        centered on `center_y` -- filled when recorded, 1px outline
+        when not. `cx` is the horizontal center to align all three on.
+
+        `size` is the TRUE pixel width/height of each circle. NOTE:
+        PIL's draw.ellipse([cx-r, cy-r, cx+r, cy+r]) actually renders
+        (2*r + 1) pixels wide, not 2*r -- confirmed by direct pixel
+        measurement (a "radius=2" box measured 5px wide, not 4). That
+        off-by-one was why the circles looked like they were touching
+        with zero gap despite the code nominally asking for a 1px gap.
+        This version computes the box from the real desired `size`
+        directly instead of doubling a radius, so the gap is accurate."""
+        half = (size - 1) / 2
+        spacing = size + gap
+        total_h = size * 3 + gap * 2
+        top = center_y - total_h // 2
+        for i in range(3):
+            cy = top + size // 2 + i * spacing
+            box = [cx - half, cy - half, cx + half, cy + half]
+            if i < game["outs"]:
+                draw.ellipse(box, fill=self.out_fill_color)
+            else:
+                draw.ellipse(box, outline=self.out_empty_color, width=1)
