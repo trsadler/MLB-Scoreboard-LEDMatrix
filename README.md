@@ -131,7 +131,7 @@ See `config_schema.json` for the full list.
 | Key | Default | Notes |
 |---|---|---|
 | `favorite_teams` | `["PHI"]` | Fallback game + rotation filter if restricted |
-| `show_favorite_teams_only` | `false` | Restrict live rotation to favorite teams' games |
+| `show_favorite_teams_only` | `false` | STRICT: never show other teams' games at all, live or otherwise |
 | `game_rotation_seconds` | `8` | How long each game shows before switching |
 | `update_interval_seconds` | `300` | Poll rate when nothing is live |
 | `live_update_interval_seconds` | `15` | Poll rate while games are live |
@@ -148,6 +148,7 @@ See `config_schema.json` for the full list.
 | `show_past_games` | `false` | Include recent final favorite-team games in rotation |
 | `show_upcoming_games` | `false` | Include upcoming favorite-team games in rotation |
 | `max_past_games` / `max_upcoming_games` | `3` / `3` | Caps on how many of each to include |
+| `past_upcoming_all_teams` | `false` | Expand past/upcoming to all teams when no favorite is live (non-strict mode only) |
 | `test_mode` | `false` | Render a fake game for layout testing |
 
 ## If text still looks wrong / blocky / generic on real hardware
@@ -214,6 +215,50 @@ rather than failing silently into the generic fallback.
 - The diamond ended up marginally bigger as a side effect of these
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
+
+## Favorite-team priority cascade
+
+Reworked how `favorite_teams` interacts with rotation, since the old
+`show_favorite_teams_only` boolean was too blunt -- it either always
+restricted to favorites or never did, regardless of whether a favorite
+was actually playing. Now:
+
+1. **A favorite team live?** Rotation shows ONLY that game (or games,
+   if multiple favorites are live simultaneously) -- past/upcoming and
+   every other team's live game are fully suppressed while this is true.
+2. **No favorite live, `show_favorite_teams_only` off (default)**: all
+   live games leaguewide + past/upcoming games (scope controlled by
+   the new `past_upcoming_all_teams`, favorites-only by default).
+3. **No favorite live, `show_favorite_teams_only` on (strict mode)**:
+   only favorites' past/upcoming games -- no other team's live game
+   ever appears, full stop.
+4. Falls out naturally: if the live portion is empty in either branch,
+   rotation is just past/upcoming; if everything is empty/disabled,
+   falls back to the single best-guess favorite game (the original
+   pre-past/upcoming-feature behavior).
+
+`show_favorite_teams_only` is kept specifically as that strict
+override -- "never show any other team's games, period" -- rather
+than being replaced by the cascade, per your call. The new
+`past_upcoming_all_teams` setting only matters in non-strict mode.
+
+**Performance note**: the extra per-game pitch-count API call and
+last-play-flash checking now only run on whichever games actually end
+up in rotation, not every live game leaguewide -- "show all live
+games" mode could otherwise mean a dozen extra summary-endpoint
+requests per poll for games that never even get displayed. Verified
+directly: set up a favorite-team game alongside three other
+leaguewide live games and confirmed enrichment was only attempted for
+the favorite's game.
+
+Verified all four cascade branches end-to-end (not just by re-reading
+the logic) using synthetic scoreboard data run through the real
+`_process_scoreboard`/`_maybe_refresh` code path: favorite-live
+suppresses everything else; non-strict fallback includes other live
+games plus favorites-only past/upcoming; strict mode excludes other
+live games entirely; and `past_upcoming_all_teams` correctly expands
+scope in non-strict mode while strict mode correctly overrides it back
+to favorites-only.
 
 ## Config cleanup
 

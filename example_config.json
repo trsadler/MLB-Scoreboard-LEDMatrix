@@ -24,6 +24,7 @@
     "show_upcoming_games": false,
     "max_past_games": 3,
     "max_upcoming_games": 3,
+    "past_upcoming_all_teams": false,
     "test_mode": false
   }
 }

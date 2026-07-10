@@ -21,7 +21,7 @@
     "show_favorite_teams_only": {
       "type": "boolean",
       "default": false,
-      "description": "If true, only cycle through favorite teams' live games. If false (default), cycle through every currently live MLB game leaguewide"
+      "description": "STRICT mode: never show any other team's games at all (live, past, or upcoming) -- always favorites only. When off (default), favorites still take priority whenever they have a live game, but other teams' live games and past/upcoming games can fill the rotation when no favorite is currently playing."
     },
     "game_rotation_seconds": {
       "type": "integer",
@@ -184,6 +184,11 @@
       "default": 3,
       "minimum": 1,
       "description": "Maximum number of upcoming favorite-team games to include in rotation"
+    },
+    "past_upcoming_all_teams": {
+      "type": "boolean",
+      "default": false,
+      "description": "Only relevant when show_favorite_teams_only is off. When no favorite team is live, this controls whether past/upcoming games expand to include all teams (true) or stay scoped to favorite teams only (false, default). Ignored (always favorites-only) when show_favorite_teams_only is on."
     }
   },
   "required": [

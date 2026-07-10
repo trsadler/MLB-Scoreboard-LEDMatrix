@@ -397,6 +397,7 @@ class TidbytBaseballPlugin(BasePlugin):
         self.show_upcoming_games = cfg.get("show_upcoming_games", False)
         self.max_past_games = cfg.get("max_past_games", 3)
         self.max_upcoming_games = cfg.get("max_upcoming_games", 3)
+        self.past_upcoming_all_teams = cfg.get("past_upcoming_all_teams", False)
         self.test_mode = cfg.get("test_mode", False)
 
     def on_config_change(self, new_config):
@@ -752,53 +753,81 @@ class TidbytBaseballPlugin(BasePlugin):
             if fallback_game:
                 self._resolve_logos(fallback_game)
 
+            # --- Favorite-team priority cascade ---
+            # 1. If ANY favorite team has a live game right now, show
+            #    ONLY that (those) live game(s) -- past/upcoming and
+            #    every other team's live game are fully suppressed
+            #    while a favorite is live.
+            # 2. Otherwise, if show_favorite_teams_only is OFF: show
+            #    every live game (any team) plus past/upcoming (scope
+            #    controlled separately by past_upcoming_all_teams).
+            # 2s. Otherwise (show_favorite_teams_only is ON, strict
+            #     mode): show only favorites' past/upcoming -- no other
+            #     team's live game ever appears.
+            # 3. Falls out naturally: if the live portion is empty in
+            #    either branch, rotation is just past/upcoming; if ALL
+            #    of that is empty too, fall back to the single
+            #    best-guess favorite game (preserves pre-this-feature
+            #    behavior for anyone with everything else off).
+            favorite_live_games = [
+                g for g in live_games
+                if g["away_abbr"] in self.favorite_teams or g["home_abbr"] in self.favorite_teams
+            ]
+
+            if favorite_live_games:
+                rotation_games = list(favorite_live_games)
+                cascade_state = "favorite team(s) live -- showing only that"
+            elif self.show_favorite_teams_only:
+                rotation_games = []
+                if self.show_past_games:
+                    rotation_games += past_games
+                if self.show_upcoming_games:
+                    rotation_games += upcoming_games
+                cascade_state = "strict mode, no favorite live -- favorites' past/upcoming only"
+            else:
+                rotation_games = list(live_games)
+                if self.show_past_games:
+                    rotation_games += past_games
+                if self.show_upcoming_games:
+                    rotation_games += upcoming_games
+                cascade_state = "no favorite live -- showing all live games + past/upcoming"
+
+            if not rotation_games and fallback_game:
+                rotation_games = [fallback_game]
+                cascade_state += " (nothing available -- using single fallback game)"
+
             # Real pitch count isn't in the lightweight scoreboard
             # response (confirmed from actual captured data) -- fetch
             # it from ESPN's more detailed per-game summary endpoint
             # instead. Wrapped in its own try/except per game so one
             # game's summary failing (or ESPN changing that endpoint's
-            # shape) can't take down the main scoreboard update. Only
-            # live games need this -- past/upcoming games have no
-            # current pitcher to look up a pitch count for.
-            for g in live_games:
+            # shape) can't take down the main scoreboard update.
+            #
+            # IMPORTANT: this only runs on the LIVE games actually
+            # selected into rotation_games, not every live game
+            # leaguewide -- "show all live games" mode could otherwise
+            # mean fetching a summary for a dozen simultaneous MLB
+            # games every poll, which is a lot of extra requests for
+            # data that never even gets displayed.
+            enrich_targets = [g for g in rotation_games if g.get("game_type") == "live"]
+            for g in enrich_targets:
                 try:
                     self._enrich_pitch_count(g)
                 except Exception as e:
                     self.logger.warning(f"Could not fetch pitch count for {g['away_abbr']}@{g['home_abbr']}: {e}")
 
-            for g in live_games:
+            for g in enrich_targets:
                 try:
                     self._maybe_trigger_last_play_flash(g)
                 except Exception as e:
                     self.logger.warning(f"Error checking last-play flash for {g['away_abbr']}@{g['home_abbr']}: {e}")
 
-            if live_games:
-                g0 = live_games[0]
-                self.logger.info(
-                    f"Fetched scoreboard OK: {len(live_games)} live game(s), "
-                    f"{len(past_games)} past, {len(upcoming_games)} upcoming. "
-                    f"First live: {g0['away_abbr']}@{g0['home_abbr']} "
-                    f"{g0['away_score']}-{g0['home_score']}, count {g0['balls']}-{g0['strikes']}, "
-                    f"outs {g0['outs']}, batter={g0.get('batter_short_name') or g0.get('batter_name')}"
-                )
-            else:
-                self.logger.info(
-                    f"Fetched scoreboard OK: no live games right now. "
-                    f"{len(past_games)} past, {len(upcoming_games)} upcoming."
-                )
-
-            # This is what actually gets rotated through and displayed.
-            # Live games always take priority; past/upcoming are appended
-            # if enabled. If none of those have anything, fall back to
-            # the single best-guess favorite-team game (old behavior,
-            # preserved for when the new game types are off or empty).
-            rotation_games = list(live_games)
-            if self.show_past_games:
-                rotation_games += past_games
-            if self.show_upcoming_games:
-                rotation_games += upcoming_games
-            if not rotation_games and fallback_game:
-                rotation_games = [fallback_game]
+            self.logger.info(
+                f"Fetched scoreboard OK: {len(live_games)} live game(s) leaguewide, "
+                f"{len(favorite_live_games)} involving a favorite team, "
+                f"{len(past_games)} past, {len(upcoming_games)} upcoming. "
+                f"Cascade: {cascade_state}. Rotation has {len(rotation_games)} game(s)."
+            )
 
             with self._data_lock:
                 self.live_games = live_games
@@ -1025,6 +1054,11 @@ class TidbytBaseballPlugin(BasePlugin):
         past_games = []
         upcoming_games = []
 
+        # Strict mode (show_favorite_teams_only) always restricts
+        # past/upcoming to favorites regardless of past_upcoming_all_teams
+        # -- that toggle only matters in non-strict mode.
+        past_upcoming_favorites_only = self.show_favorite_teams_only or not self.past_upcoming_all_teams
+
         for event in events:
             competitions = event.get("competitions", [])
             if not competitions:
@@ -1036,16 +1070,18 @@ class TidbytBaseballPlugin(BasePlugin):
             involves_favorite = any(fav in abbrevs for fav in self.favorite_teams)
 
             if state == "in":
-                game = self._parse_game(event, comp, game_type="live")
-                if self.show_favorite_teams_only:
-                    if involves_favorite:
-                        live_games.append(game)
-                else:
-                    live_games.append(game)
-            elif state == "post" and self.show_past_games and involves_favorite:
-                past_games.append(self._parse_game(event, comp, game_type="final"))
-            elif state == "pre" and self.show_upcoming_games and involves_favorite:
-                upcoming_games.append(self._parse_game(event, comp, game_type="upcoming"))
+                # Collect ALL live games here, unfiltered -- the
+                # favorite-vs-other cascade decision (which of these
+                # actually get shown) happens in _maybe_refresh, since
+                # it needs to know whether ANY favorite is live before
+                # deciding whether to include everyone else.
+                live_games.append(self._parse_game(event, comp, game_type="live"))
+            elif state == "post" and self.show_past_games:
+                if involves_favorite or not past_upcoming_favorites_only:
+                    past_games.append(self._parse_game(event, comp, game_type="final"))
+            elif state == "pre" and self.show_upcoming_games:
+                if involves_favorite or not past_upcoming_favorites_only:
+                    upcoming_games.append(self._parse_game(event, comp, game_type="upcoming"))
 
         past_games = past_games[: self.max_past_games]
 
