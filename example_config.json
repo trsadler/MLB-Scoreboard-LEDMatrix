@@ -18,6 +18,9 @@
     "out_empty_color": [120, 120, 120],
     "font_choice": "tom_thumb",
     "show_batter_name": true,
+    "show_last_play": true,
+    "last_play_display_seconds": 5,
+    "last_play_filter": "significant",
     "test_mode": false
   }
 }

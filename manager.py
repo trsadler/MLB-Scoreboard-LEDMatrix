@@ -94,6 +94,22 @@ FONT_CHOICES = {
 # for the TTF options.
 BDF_FONT_CHOICES = {"tom_thumb"}
 
+# Routine pitch-by-pitch play types to SKIP when last_play_filter is
+# "significant" -- i.e., don't flash for these, only for actual outcomes
+# (hits, walks, strikeouts, outs, runs, etc.). This is a denylist rather
+# than an allowlist of "big moment" types on purpose: only two real
+# samples of situation.lastPlay.type.type have been confirmed so far
+# ("ball" and "start-batterpitcher"), so a denylist means an unknown
+# type defaults to SHOWING (safer for not missing a real highlight)
+# rather than defaulting to hidden. Add more here if routine updates
+# still slip through once you see this against more live data.
+NON_SIGNIFICANT_PLAY_TYPES = {
+    "ball", "strike", "strike-looking", "strike-swinging",
+    "foul", "foul-ball", "foul-tip",
+    "start-batterpitcher", "pitch", "no-pitch",
+    "automatic-ball", "automatic-strike", "warmup",
+}
+
 # Preference order for auto-discovering a bundled font from the main
 # LEDMatrix install, used only when font_choice is "system" or the
 # selected bundled file is missing for some reason.
@@ -217,6 +233,13 @@ class TidbytBaseballPlugin(BasePlugin):
         self.last_switch_time: float = time.time()
         self.last_fetch_time: float = 0.0
 
+        # Per-game (keyed by event_id) last-play flash state. Games get
+        # entirely new dicts each poll (live_games is rebuilt from
+        # scratch), so this has to live on self, not on the game dict,
+        # to persist across polls.
+        self._last_shown_play_id: Dict[str, str] = {}
+        self._flash_until: Dict[str, float] = {}
+
         self._logo_cache: Dict[str, Optional[Image.Image]] = {}
         self._font_cache: Dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
         self._fit_font_cache: Dict[Tuple[str, int, bool], ImageFont.FreeTypeFont] = {}
@@ -337,6 +360,9 @@ class TidbytBaseballPlugin(BasePlugin):
         self.out_empty_color = tuple(cfg.get("out_empty_color", [120, 120, 120]))
         self.font_choice = cfg.get("font_choice", "tom_thumb")
         self.show_batter_name = cfg.get("show_batter_name", True)
+        self.show_last_play = cfg.get("show_last_play", True)
+        self.last_play_display_seconds = cfg.get("last_play_display_seconds", 5)
+        self.last_play_filter = cfg.get("last_play_filter", "significant")
         self.test_mode = cfg.get("test_mode", False)
 
     def on_config_change(self, new_config):
@@ -712,6 +738,12 @@ class TidbytBaseballPlugin(BasePlugin):
                 except Exception as e:
                     self.logger.warning(f"Could not fetch pitch count for {g['away_abbr']}@{g['home_abbr']}: {e}")
 
+            for g in live_games:
+                try:
+                    self._maybe_trigger_last_play_flash(g)
+                except Exception as e:
+                    self.logger.warning(f"Error checking last-play flash for {g['away_abbr']}@{g['home_abbr']}: {e}")
+
             if live_games:
                 g0 = live_games[0]
                 self.logger.info(
@@ -737,6 +769,46 @@ class TidbytBaseballPlugin(BasePlugin):
                 f"a parsing bug -- please share this traceback.",
                 exc_info=True,
             )
+
+    def _maybe_trigger_last_play_flash(self, game: Dict[str, Any]):
+        """Detects when a game has a NEW play (by comparing lastPlay's
+        id against what we last saw for this specific game, keyed by
+        event_id since game dicts are rebuilt fresh every poll) and, if
+        it's a "significant" play type, sets a flash window during
+        which display() shows the play text instead of the normal
+        right-half layout.
+
+        Deliberately does NOT flash the very first time we ever see a
+        given game (i.e., when we have no previous play id to compare
+        against) -- otherwise every game would flash immediately on
+        first load / plugin startup for whatever play happened to be
+        current already, which isn't really a "new" play from the
+        person watching the display's perspective."""
+        if not self.show_last_play:
+            return
+        event_id = game.get("event_id")
+        play_id = game.get("last_play_id")
+        if not event_id or not play_id:
+            return
+
+        with self._data_lock:
+            previous_id = self._last_shown_play_id.get(event_id)
+            self._last_shown_play_id[event_id] = play_id
+
+            if previous_id is None or play_id == previous_id:
+                return  # first time seeing this game, or no change
+
+            play_type = (game.get("last_play_type") or "").lower()
+            is_significant = (
+                self.last_play_filter != "significant"
+                or play_type not in NON_SIGNIFICANT_PLAY_TYPES
+            )
+            if is_significant:
+                self._flash_until[event_id] = time.time() + self.last_play_display_seconds
+                self.logger.info(
+                    f"Last-play flash triggered for {game['away_abbr']}@{game['home_abbr']}: "
+                    f"\"{game.get('last_play_text')}\" (type={play_type})"
+                )
 
     def _enrich_pitch_count(self, game: Dict[str, Any]):
         """Fetches ESPN's detailed per-game summary endpoint and tries
@@ -990,9 +1062,27 @@ class TidbytBaseballPlugin(BasePlugin):
                     continue
             return None
 
+        def extract_last_play(situation_dict):
+            """Confirmed against the same real live-game data captured
+            earlier (ATH@DET, SEA@MIA): situation.lastPlay.{id, text,
+            type.type}. Unlike pitch count, this field IS present in
+            the lightweight scoreboard endpoint -- no extra API call
+            needed. `type.type` is a short code (seen so far: "ball",
+            "start-batterpitcher") used to filter out routine
+            pitch-by-pitch updates from actual play outcomes."""
+            try:
+                lp = situation_dict.get("lastPlay") or {}
+                play_id = lp.get("id")
+                play_text = lp.get("text")
+                play_type = (lp.get("type") or {}).get("type", "")
+                return play_id, play_text, play_type
+            except Exception:
+                return None, None, None
+
         batter_full, batter_short = extract_batter_info(situation)
         pitcher_full, pitcher_short = extract_pitcher_info(situation)
         pitch_count = extract_pitch_count(situation)
+        last_play_id, last_play_text, last_play_type = extract_last_play(situation)
 
         return {
             "state": status_type.get("state", "pre"),
@@ -1017,6 +1107,9 @@ class TidbytBaseballPlugin(BasePlugin):
             "pitcher_short_name": pitcher_short,
             "pitch_count": pitch_count,
             "event_id": event.get("id"),
+            "last_play_id": last_play_id,
+            "last_play_text": last_play_text,
+            "last_play_type": last_play_type,
             "on_first": bool(situation.get("onFirst")),
             "on_second": bool(situation.get("onSecond")),
             "on_third": bool(situation.get("onThird")),
@@ -1045,6 +1138,10 @@ class TidbytBaseballPlugin(BasePlugin):
             "pitcher_name": "Tarik Skubal",
             "pitcher_short_name": "T. Skubal",
             "pitch_count": 47,
+            "event_id": "test-event-1",
+            "last_play_id": "test-play-1",
+            "last_play_text": "Riley Greene singles to left field.",
+            "last_play_type": "single",
             "on_first": True,
             "on_second": False,
             "on_third": True,
@@ -1175,79 +1272,90 @@ class TidbytBaseballPlugin(BasePlugin):
             right_x0 = left_w + 2
             right_w = width - right_x0 - 1
 
-            top_margin = 1
-            lower_y = height - 6  # bottom-row (count/batter) text measures ~5px tall
+            event_id = game.get("event_id")
+            with self._data_lock:
+                flash_until = self._flash_until.get(event_id, 0) if event_id else 0
+            show_flash = time.time() < flash_until
 
-            # --- Top row: pitch count + pitcher name, in the space
-            #     freed up by moving inning/outs down next to the diamond ---
-            # IMPORTANT: reserve a FIXED height here regardless of what
-            # _draw_pitch_info actually returns. Using the real returned
-            # height would make diamond_y (and therefore the diamond's
-            # whole size) depend on whether THIS PARTICULAR game has
-            # pitcher data -- which is exactly why the bases looked a
-            # different size between games as the display cycled: some
-            # games had a pitcher name (row ~6px tall) and others didn't
-            # (row 0px tall), so the diamond got more or less vertical
-            # room each time. A fixed reservation keeps geometry
-            # identical across every game regardless of its data.
-            pitch_row_reserved_h = 6
-            has_batter = bool(game.get("batter_name") or game.get("batter_short_name"))
-            has_pitcher = bool(game.get("pitcher_name") or game.get("pitcher_short_name"))
-            if not has_batter and not has_pitcher:
-                # Mid-inning gap in ESPN's data (between at-bats, after
-                # a play, etc.) -- show who's due up next instead of
-                # leaving this row blank.
-                batting_team = game["away_abbr"] if game["inning_half"] else game["home_abbr"]
-                self._draw_due_up(image, draw, right_x0 + 1, top_margin, right_w - 2, batting_team)
-            else:
-                self._draw_pitch_info(
-                    image, draw, right_x0 + 1, top_margin, right_w - 2,
-                    game.get("pitch_count"), game.get("pitcher_name"), game.get("pitcher_short_name"),
+            if show_flash:
+                self._draw_last_play(
+                    image, draw, right_x0, 0, right_w, height,
+                    game.get("last_play_text") or "", fill=(255, 255, 255),
                 )
+            else:
+                top_margin = 1
+                lower_y = height - 6  # bottom-row (count/batter) text measures ~5px tall
 
-            # --- Middle: diamond centered, inning (left) and outs
-            #     (right) vertically centered against it ---
-            # Reserve real horizontal space for inning/outs first (measuring
-            # actual glyph width, not guessing), THEN size the diamond to
-            # fit exactly what's left -- this is what guarantees no overlap,
-            # rather than assuming a fixed diamond width and hoping it fits.
-            diamond_y = top_margin + pitch_row_reserved_h + 1
-            diamond_available_h = (lower_y - 2) - diamond_y
+                # --- Top row: pitch count + pitcher name, in the space
+                #     freed up by moving inning/outs down next to the diamond ---
+                # IMPORTANT: reserve a FIXED height here regardless of what
+                # _draw_pitch_info actually returns. Using the real returned
+                # height would make diamond_y (and therefore the diamond's
+                # whole size) depend on whether THIS PARTICULAR game has
+                # pitcher data -- which is exactly why the bases looked a
+                # different size between games as the display cycled: some
+                # games had a pitcher name (row ~6px tall) and others didn't
+                # (row 0px tall), so the diamond got more or less vertical
+                # room each time. A fixed reservation keeps geometry
+                # identical across every game regardless of its data.
+                pitch_row_reserved_h = 6
+                has_batter = bool(game.get("batter_name") or game.get("batter_short_name"))
+                has_pitcher = bool(game.get("pitcher_name") or game.get("pitcher_short_name"))
+                if not has_batter and not has_pitcher:
+                    # Mid-inning gap in ESPN's data (between at-bats, after
+                    # a play, etc.) -- show who's due up next instead of
+                    # leaving this row blank.
+                    batting_team = game["away_abbr"] if game["inning_half"] else game["home_abbr"]
+                    self._draw_due_up(image, draw, right_x0 + 1, top_margin, right_w - 2, batting_team)
+                else:
+                    self._draw_pitch_info(
+                        image, draw, right_x0 + 1, top_margin, right_w - 2,
+                        game.get("pitch_count"), game.get("pitcher_name"), game.get("pitcher_short_name"),
+                    )
 
-            inning_tri_size = 6
-            sample_bbox = self._measure(self.font_tiny, "12")  # worst-case 2-digit inning
-            inning_number_w = sample_bbox[2] - sample_bbox[0]
-            inning_reserved_w = inning_tri_size + 3 + inning_number_w + 2
+                # --- Middle: diamond centered, inning (left) and outs
+                #     (right) vertically centered against it ---
+                # Reserve real horizontal space for inning/outs first (measuring
+                # actual glyph width, not guessing), THEN size the diamond to
+                # fit exactly what's left -- this is what guarantees no overlap,
+                # rather than assuming a fixed diamond width and hoping it fits.
+                diamond_y = top_margin + pitch_row_reserved_h + 1
+                diamond_available_h = (lower_y - 2) - diamond_y
 
-            outs_size = 4
-            outs_reserved_w = outs_size + 2 + 3
+                inning_tri_size = 6
+                sample_bbox = self._measure(self.font_tiny, "12")  # worst-case 2-digit inning
+                inning_number_w = sample_bbox[2] - sample_bbox[0]
+                inning_reserved_w = inning_tri_size + 3 + inning_number_w + 2
 
-            available_diamond_w = right_w - inning_reserved_w - outs_reserved_w
-            diamond_w = max(min(int(right_w * 0.5), available_diamond_w), 16)
-            diamond_x = right_x0 + inning_reserved_w
+                outs_size = 4
+                outs_reserved_w = outs_size + 2 + 3
 
-            self._draw_diamond(draw, diamond_x, diamond_y, diamond_w, diamond_available_h, game)
-            geo = self._diamond_geometry(diamond_x, diamond_y, diamond_w, diamond_available_h)
+                available_diamond_w = right_w - inning_reserved_w - outs_reserved_w
+                diamond_w = max(min(int(right_w * 0.5), available_diamond_w), 16)
+                diamond_x = right_x0 + inning_reserved_w
 
-            inning_y = geo["center_y"] - inning_tri_size // 2
-            self._draw_inning(image, right_x0 + 1, inning_y, game)
+                self._draw_diamond(draw, diamond_x, diamond_y, diamond_w, diamond_available_h, game)
+                geo = self._diamond_geometry(diamond_x, diamond_y, diamond_w, diamond_available_h)
 
-            outs_cx = right_x0 + right_w - 3 - outs_size // 2
-            self._draw_outs(draw, outs_cx, geo["center_y"], game, size=outs_size, gap=1)
+                inning_y = geo["center_y"] - inning_tri_size // 2
+                self._draw_inning(image, right_x0 + 1, inning_y, game)
 
-            # --- Bottom row: batter left-aligned (matching inning/
-            #     pitch-count's left edge above), count right-aligned
-            #     in the bottom-right corner ---
-            count_text = f"{game['balls']}-{game['strikes']}"
-            count_bbox = self._measure(self.font_count, count_text)
-            count_w = count_bbox[2] - count_bbox[0]
-            count_x = (right_x0 + right_w) - count_w - 2
-            self._draw_count(image, count_x, lower_y, game)
+                outs_cx = right_x0 + right_w - 3 - outs_size // 2
+                self._draw_outs(draw, outs_cx, geo["center_y"], game, size=outs_size, gap=1)
 
-            if self.show_batter_name:
-                batter_x = right_x0 + 1
-                batter_max_w = count_x - 2 - batter_x
-                self._draw_batter(image, draw, batter_x, lower_y, batter_max_w, game.get("batter_name"), game.get("batter_short_name"))
+                # --- Bottom row: batter left-aligned (matching inning/
+                #     pitch-count's left edge above), count right-aligned
+                #     in the bottom-right corner ---
+                count_text = f"{game['balls']}-{game['strikes']}"
+                count_bbox = self._measure(self.font_count, count_text)
+                count_w = count_bbox[2] - count_bbox[0]
+                count_x = (right_x0 + right_w) - count_w - 2
+                self._draw_count(image, count_x, lower_y, game)
+
+                if self.show_batter_name:
+                    batter_x = right_x0 + 1
+                    batter_max_w = count_x - 2 - batter_x
+                    self._draw_batter(image, draw, batter_x, lower_y, batter_max_w, game.get("batter_name"), game.get("batter_short_name"))
         except Exception as e:
             # Same reasoning as the try/except added around update()'s
             # parsing: a rendering bug triggered by one unusual game
@@ -1443,6 +1551,72 @@ class TidbytBaseballPlugin(BasePlugin):
     def _draw_count(self, image, x, y, game):
         count_text = f"{game['balls']}-{game['strikes']}"
         self._render_text(image, (x, y), count_text, self.font_count, (255, 200, 0))
+
+    def _wrap_text_lines(self, font, text: str, max_width: int) -> List[str]:
+        """Greedy word-wrap: fits as many words per line as possible
+        within max_width, wrapping to a new line when the next word
+        would overflow."""
+        words = text.split()
+        if not words:
+            return []
+        lines = []
+        current = words[0]
+        for word in words[1:]:
+            trial = f"{current} {word}"
+            bbox = self._measure(font, trial)
+            if bbox[2] - bbox[0] <= max_width:
+                current = trial
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
+
+    def _draw_last_play(self, image, draw, x0, y0, w, h, text: str, fill=(255, 255, 255)):
+        """Word-wraps `text` (a full play description, e.g. "Aaron
+        Judge homers to right field, 2 RBI") across as many lines as
+        fit in the box, picking the largest font size that lets it fit
+        both width- and height-wise. Falls back to the smallest size
+        with truncated lines (ellipsis on the last visible line) if
+        even that doesn't fully fit -- rare, but better than silently
+        cutting off mid-sentence with no indication."""
+        if not text:
+            return
+
+        max_text_width = w - 4
+        best_font = None
+        best_lines = None
+        for size in range(9, 4, -1):
+            font = self._load_font(size, bold=True)
+            lines = self._wrap_text_lines(font, text, max_text_width)
+            line_bbox = self._measure(font, "Ag")
+            line_h = (line_bbox[3] - line_bbox[1]) + 2
+            total_h = line_h * len(lines)
+            all_fit_width = all(self._measure(font, ln)[2] - self._measure(font, ln)[0] <= max_text_width for ln in lines)
+            if total_h <= h and all_fit_width:
+                best_font, best_lines = font, lines
+                break
+
+        if best_font is None:
+            font = self._load_font(5, bold=True)
+            lines = self._wrap_text_lines(font, text, max_text_width)
+            line_bbox = self._measure(font, "Ag")
+            line_h = (line_bbox[3] - line_bbox[1]) + 2
+            max_lines = max(h // line_h, 1)
+            if len(lines) > max_lines:
+                lines = lines[:max_lines]
+                lines[-1] = lines[-1].rstrip() + "..."
+            best_font, best_lines = font, lines
+
+        line_bbox = self._measure(best_font, "Ag")
+        line_h = (line_bbox[3] - line_bbox[1]) + 2
+        total_h = line_h * len(best_lines)
+        start_y = y0 + max((h - total_h) // 2, 0)
+        for i, line in enumerate(best_lines):
+            lbbox = self._measure(best_font, line)
+            line_w = lbbox[2] - lbbox[0]
+            lx = x0 + max((w - line_w) // 2, 0)
+            self._render_text(image, (lx, start_y + i * line_h), line, best_font, fill)
 
     def _draw_due_up(self, image, draw, x, y, max_width, team_abbr):
         """Shows "TEAM DUE UP" in red, in the same spot pitch count/

@@ -209,7 +209,55 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
-## Fixed: tightening was silently skipped whenever truncation kicked in
+## New: last-play overlay
+
+When something significant happens (hit, walk, strikeout, out, run
+scored), the black half temporarily shows the play description instead
+of the normal inning/diamond/count layout, then reverts automatically.
+Team panels on the left stay untouched throughout.
+
+- **Data source**: `situation.lastPlay` -- confirmed present in the
+  same real live-game JSON already captured for this plugin (unlike
+  pitch count, this field IS in the lightweight scoreboard endpoint,
+  so no extra API call was needed).
+- **Filtering**: `situation.lastPlay.type.type` is checked against a
+  denylist (`NON_SIGNIFICANT_PLAY_TYPES`) of routine pitch-level
+  updates -- confirmed from real data that ESPN sends a new `lastPlay`
+  on *every single pitch*, not just outcomes (one sample was literally
+  `"Pitch 2 : Ball 2"`). Only two real type codes have been confirmed
+  so far (`"ball"` and `"start-batterpitcher"`) -- I only have two
+  samples to go on, so this is a denylist rather than an allowlist on
+  purpose: an unknown type defaults to showing rather than defaulting
+  to hidden, so a real highlight is less likely to get silently
+  filtered out by an unrecognized type code. If routine updates still
+  slip through, add the offending type string to
+  `NON_SIGNIFICANT_PLAY_TYPES` in `manager.py`.
+- **Doesn't flash on first sighting**: a game's very first poll never
+  triggers a flash (nothing to compare against yet) -- otherwise every
+  game would flash immediately on plugin startup for whatever play
+  happened to already be current.
+- **Per-game tracking**: each game's last-seen play ID and flash
+  deadline are tracked separately (keyed by ESPN's event ID), so
+  switching between games in rotation can't show a stale or mismatched
+  flash from a different game.
+- **Text wrapping**: play descriptions are full sentences, so
+  `_draw_last_play` word-wraps across multiple lines, picking the
+  largest font size that fits both the width and the available height,
+  falling back to the smallest size with a truncated+ellipsis line if
+  even that doesn't fully fit.
+
+**Config**: `show_last_play` (on/off), `last_play_display_seconds`
+(default 5), `last_play_filter` (`"significant"` or `"all"` -- `"all"`
+flashes for every single play update including routine pitches, per
+your choice of a conservative denylist-based filter for the default).
+
+Tested the trigger logic directly (first-sighting suppression, routine
+plays correctly NOT triggering, significant plays correctly triggering,
+and the flash correctly expiring after its configured duration) and
+confirmed the overlay actually renders wrapped text while leaving the
+left-side team panels untouched.
+
+
 
 This was a real, systemic bug, not occasional -- confirmed by testing
 several realistic pitcher name/pitch-count combinations against the
