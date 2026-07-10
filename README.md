@@ -209,7 +209,17 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
-## Tightened spacing: "P:" and first-initial-to-lastname gaps
+## Batter left-aligned, count moved to bottom-right corner
+
+Batter name now starts at the same left x-position as the inning
+indicator and pitch count/pitcher name above it, for a consistent left
+edge down the whole column. Ball-strike count moved to the bottom-right
+corner, right-aligned. Verified numerically that batter's available
+width is correctly capped before the count's position (no overlap --
+confirmed a clean 2px gap between them) and confirmed via rendered
+pixel colors that each element lands in the expected corner.
+
+
 
 Found the real cause: the "extra space" wasn't spacing added between
 characters, it was blank design space baked into narrow glyphs

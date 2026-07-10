@@ -1223,15 +1223,18 @@ class TidbytBaseballPlugin(BasePlugin):
             outs_cx = right_x0 + right_w - 3 - outs_size // 2
             self._draw_outs(draw, outs_cx, geo["center_y"], game, size=outs_size, gap=1)
 
-            # --- Bottom row: count + batter, unchanged ---
+            # --- Bottom row: batter left-aligned (matching inning/
+            #     pitch-count's left edge above), count right-aligned
+            #     in the bottom-right corner ---
             count_text = f"{game['balls']}-{game['strikes']}"
-            self._draw_count(image, right_x0 + 1, lower_y, game)
+            count_bbox = self._measure(self.font_count, count_text)
+            count_w = count_bbox[2] - count_bbox[0]
+            count_x = (right_x0 + right_w) - count_w - 2
+            self._draw_count(image, count_x, lower_y, game)
 
             if self.show_batter_name:
-                count_bbox = self._measure(self.font_count, count_text)
-                count_w = count_bbox[2] - count_bbox[0]
-                batter_x = right_x0 + 1 + count_w + 4
-                batter_max_w = (right_x0 + right_w) - batter_x
+                batter_x = right_x0 + 1
+                batter_max_w = count_x - 2 - batter_x
                 self._draw_batter(image, draw, batter_x, lower_y, batter_max_w, game.get("batter_name"), game.get("batter_short_name"))
         except Exception as e:
             # Same reasoning as the try/except added around update()'s
