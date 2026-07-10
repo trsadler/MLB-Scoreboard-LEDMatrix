@@ -1118,10 +1118,19 @@ class TidbytBaseballPlugin(BasePlugin):
             # room each time. A fixed reservation keeps geometry
             # identical across every game regardless of its data.
             pitch_row_reserved_h = 6
-            self._draw_pitch_info(
-                image, draw, right_x0 + 1, top_margin, right_w - 2,
-                game.get("pitch_count"), game.get("pitcher_name"), game.get("pitcher_short_name"),
-            )
+            has_batter = bool(game.get("batter_name") or game.get("batter_short_name"))
+            has_pitcher = bool(game.get("pitcher_name") or game.get("pitcher_short_name"))
+            if not has_batter and not has_pitcher:
+                # Mid-inning gap in ESPN's data (between at-bats, after
+                # a play, etc.) -- show who's due up next instead of
+                # leaving this row blank.
+                batting_team = game["away_abbr"] if game["inning_half"] else game["home_abbr"]
+                self._draw_due_up(image, draw, right_x0 + 1, top_margin, right_w - 2, batting_team)
+            else:
+                self._draw_pitch_info(
+                    image, draw, right_x0 + 1, top_margin, right_w - 2,
+                    game.get("pitch_count"), game.get("pitcher_name"), game.get("pitcher_short_name"),
+                )
 
             # --- Middle: diamond centered, inning (left) and outs
             #     (right) vertically centered against it ---
@@ -1137,7 +1146,7 @@ class TidbytBaseballPlugin(BasePlugin):
             inning_number_w = sample_bbox[2] - sample_bbox[0]
             inning_reserved_w = inning_tri_size + 3 + inning_number_w + 2
 
-            outs_size = 3
+            outs_size = 4
             outs_reserved_w = outs_size + 2 + 3
 
             available_diamond_w = right_w - inning_reserved_w - outs_reserved_w
@@ -1358,6 +1367,30 @@ class TidbytBaseballPlugin(BasePlugin):
     def _draw_count(self, image, x, y, game):
         count_text = f"{game['balls']}-{game['strikes']}"
         self._render_text(image, (x, y), count_text, self.font_count, (255, 200, 0))
+
+    def _draw_due_up(self, image, draw, x, y, max_width, team_abbr):
+        """Shows "(TEAM) DUE UP" in the same spot pitch count/pitcher
+        name normally occupies, for when ESPN's data has a gap between
+        at-bats (no current batter or pitcher listed). `team_abbr` is
+        whichever team is currently batting, derived from inning_half
+        by the caller."""
+        text = f"({team_abbr}) DUE UP"
+        font = self._fit_font_for_width(draw, text, max_width, start_size=7, min_size=4)
+        bbox = self._measure(font, text)
+        text_to_draw = text
+        if bbox[2] - bbox[0] > max_width:
+            truncated = text
+            text_to_draw = None
+            while truncated:
+                candidate = truncated + "."
+                cbbox = self._measure(font, candidate)
+                if cbbox[2] - cbbox[0] <= max_width:
+                    text_to_draw = candidate
+                    break
+                truncated = truncated[:-1]
+            if text_to_draw is None:
+                return
+        self._render_text(image, (x, y), text_to_draw, font, (180, 180, 220))
 
     def _draw_pitch_info(self, image, draw, x, y, max_width, pitch_count, pitcher_name, pitcher_short_name):
         """Draws 'P:<count> <Pitcher Name>' at the top of the black

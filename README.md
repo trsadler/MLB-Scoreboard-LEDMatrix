@@ -209,7 +209,25 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
-## Real pitch count now fetched (extra API call per live game)
+## Bigger outs circles, and "TEAM DUE UP" for mid-inning data gaps
+
+- **Outs circles**: increased from 3px to 4px. Re-verified the gap is
+  still exactly 1px (not touching) by directly measuring rendered
+  pixels, same approach as the last fix -- tested `size=4, gap=1`
+  against a few alternatives before picking this one specifically
+  because it measured a clean 1px gap.
+- **"(TEAM) DUE UP"**: when ESPN's data has a gap between at-bats (no
+  current batter AND no current pitcher listed -- this happens
+  sometimes between plays), the top row now shows which team is up
+  next instead of sitting blank. Team is derived from `inning_half`
+  (away team if top of the inning, home team if bottom). Same
+  fit-to-width and truncation safety as the other text elements.
+  Verified it actually renders (checked real pixel output, not just
+  that the code runs) and confirmed the diamond/inning/outs geometry
+  is unaffected since the row still reserves the same fixed height
+  either way.
+
+
 
 Since ESPN's lightweight scoreboard endpoint doesn't include pitch
 count, this now makes a second request per live game per poll cycle to
