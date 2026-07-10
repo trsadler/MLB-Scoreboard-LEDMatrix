@@ -209,7 +209,41 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
-## Fixed: data still not updating (root cause was the core scheduler, not an exception)
+## New layout: pitcher/pitch count, repositioned inning/outs, swapped colors
+
+- **Color swap**: the darker shade now sits behind each team's logo
+  (better contrast for light/white logo elements), and the full bright
+  team color moved to the text bar behind the abbreviation/score.
+- **Outs**: now vertically stacked circles (filled = recorded, 1px
+  outline = not) instead of a horizontal row of squares, positioned to
+  the right of the diamond.
+- **Inning indicator**: moved down to sit vertically centered on the
+  left side of the diamond, instead of pinned to the top corner.
+- **New top row**: pitch count + pitcher name, in the space freed up by
+  moving inning/outs down. Format is `"P:<count> <Pitcher Name>"` when
+  a pitch count is available, or just the pitcher's name if not.
+
+**Important caveat on pitch count**: the real live-game JSON already
+captured for this plugin (during earlier batter-name debugging) shows
+`situation.pitcher` only contains `playerId`/`period`/`athlete`/
+`projections`/`summary` -- no explicit numeric pitch-count field.
+`extract_pitch_count()` tries a few plausible alternate paths in case
+it's available under a different key or in other game states, but
+based on the data already seen, **it will likely just show the
+pitcher's name without a count** rather than populating `P:47`. If you
+want a guaranteed accurate live pitch count, that would need an extra
+per-game API call to ESPN's more detailed boxscore/summary endpoint --
+let me know if you want that added (it's a bigger change: one more
+HTTP request per live game per poll, not a quick fix).
+
+**Diamond size**: reworked to reserve exact horizontal space for
+inning (left) and outs (right) based on their *actual measured widths*
+(not a guessed proportion), then size the diamond to fill exactly
+what's left -- verified numerically that nothing overlaps. This
+happened to leave slightly more room than before, so the diamond is a
+bit bigger than in the previous layout.
+
+
 
 The exception-handling fix above didn't resolve it, which ruled out
 that hypothesis and confirmed the other one: **the core LEDMatrix

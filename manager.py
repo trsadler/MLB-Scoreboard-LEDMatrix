@@ -750,7 +750,45 @@ class TidbytBaseballPlugin(BasePlugin):
                     continue
             return None, None
 
+        def extract_pitcher_info(situation_dict):
+            """Same shape as the batter extraction, confirmed against
+            the same real live-game data: situation.pitcher.athlete.
+            {displayName, fullName, shortName}."""
+            try:
+                athlete = situation_dict.get("pitcher", {}).get("athlete", {})
+                full = athlete.get("displayName") or athlete.get("fullName")
+                short = athlete.get("shortName")
+                return full, short
+            except Exception:
+                return None, None
+
+        def extract_pitch_count(situation_dict):
+            """NOTE: the real live-game JSON already captured for this
+            plugin shows situation.pitcher only has playerId/period/
+            athlete/projections/summary (summary being a text string
+            like "0.1 IP, 0 ER, 0 H, 0 BB") -- no explicit numeric pitch
+            count field. These candidate paths are best-effort in case
+            it appears under a different key or later in some games;
+            if none match, this returns None and the display just
+            shows the pitcher's name without a count number rather than
+            a misleading placeholder."""
+            candidates = [
+                lambda s: s.get("pitcher", {}).get("pitchCount"),
+                lambda s: s.get("pitcher", {}).get("pitches"),
+                lambda s: s.get("pitchCount"),
+            ]
+            for getter in candidates:
+                try:
+                    val = getter(situation_dict)
+                    if val is not None:
+                        return val
+                except Exception:
+                    continue
+            return None
+
         batter_full, batter_short = extract_batter_info(situation)
+        pitcher_full, pitcher_short = extract_pitcher_info(situation)
+        pitch_count = extract_pitch_count(situation)
 
         return {
             "state": status_type.get("state", "pre"),
@@ -771,6 +809,9 @@ class TidbytBaseballPlugin(BasePlugin):
             "outs": situation.get("outs", 0),
             "batter_name": batter_full,
             "batter_short_name": batter_short,
+            "pitcher_name": pitcher_full,
+            "pitcher_short_name": pitcher_short,
+            "pitch_count": pitch_count,
             "on_first": bool(situation.get("onFirst")),
             "on_second": bool(situation.get("onSecond")),
             "on_third": bool(situation.get("onThird")),
@@ -796,6 +837,9 @@ class TidbytBaseballPlugin(BasePlugin):
             "outs": 1,
             "batter_name": "Riley Greene",
             "batter_short_name": "R. Greene",
+            "pitcher_name": "Tarik Skubal",
+            "pitcher_short_name": "T. Skubal",
+            "pitch_count": 47,
             "on_first": True,
             "on_second": False,
             "on_third": True,
@@ -897,8 +941,12 @@ class TidbytBaseballPlugin(BasePlugin):
         col_w = left_w // 2
 
         try:
-            draw.rectangle([0, 0, col_w - 1, height - 1], fill=game["away_color"])
-            draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=game["home_color"])
+            # Swapped per request: the darker shade now sits behind the
+            # logo (better contrast so light/white logo elements don't
+            # wash out against a bright saturated color), and the full
+            # bright team color moves to the text bar instead.
+            draw.rectangle([0, 0, col_w - 1, height - 1], fill=self._darken_color(game["away_color"]))
+            draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=self._darken_color(game["home_color"]))
 
             away_txt_color = self._text_color_for(game["away_color"])
             home_txt_color = self._text_color_for(game["home_color"])
@@ -922,19 +970,47 @@ class TidbytBaseballPlugin(BasePlugin):
             right_x0 = left_w + 2
             right_w = width - right_x0 - 1
 
-            top_margin = 2  # keeps inning triangle/number and outs off the physical top edge
-            self._draw_inning(image, right_x0 + 1, top_margin, game)
-            self._draw_outs(draw, right_x0, top_margin, right_w, game)
+            top_margin = 1
+            lower_y = height - 6  # bottom-row (count/batter) text measures ~5px tall
+
+            # --- Top row: pitch count + pitcher name, in the space
+            #     freed up by moving inning/outs down next to the diamond ---
+            pitch_row_h = self._draw_pitch_info(
+                image, draw, right_x0 + 1, top_margin, right_w - 2,
+                game.get("pitch_count"), game.get("pitcher_name"), game.get("pitcher_short_name"),
+            )
+
+            # --- Middle: diamond centered, inning (left) and outs
+            #     (right) vertically centered against it ---
+            # Reserve real horizontal space for inning/outs first (measuring
+            # actual glyph width, not guessing), THEN size the diamond to
+            # fit exactly what's left -- this is what guarantees no overlap,
+            # rather than assuming a fixed diamond width and hoping it fits.
+            diamond_y = top_margin + pitch_row_h + 1
+            diamond_available_h = (lower_y - 2) - diamond_y
 
             inning_tri_size = 6
-            top_row_bottom = top_margin + inning_tri_size
-            lower_y = height - 6  # bottom-row text measures ~5px tall, so this is measured, not padded
-            diamond_y = top_row_bottom
-            diamond_available_h = (lower_y - 2) - diamond_y  # leave a clear gap before the bottom row
-            diamond_w = int(right_w * 0.5)
-            diamond_x = right_x0 + (right_w - diamond_w) // 2
-            self._draw_diamond(draw, diamond_x, diamond_y, diamond_w, diamond_available_h, game)
+            sample_bbox = self._measure(self.font_tiny, "12")  # worst-case 2-digit inning
+            inning_number_w = sample_bbox[2] - sample_bbox[0]
+            inning_reserved_w = inning_tri_size + 3 + inning_number_w + 2
 
+            outs_diameter = 4
+            outs_reserved_w = outs_diameter + 2 + 3
+
+            available_diamond_w = right_w - inning_reserved_w - outs_reserved_w
+            diamond_w = max(min(int(right_w * 0.5), available_diamond_w), 16)
+            diamond_x = right_x0 + inning_reserved_w
+
+            self._draw_diamond(draw, diamond_x, diamond_y, diamond_w, diamond_available_h, game)
+            geo = self._diamond_geometry(diamond_x, diamond_y, diamond_w, diamond_available_h)
+
+            inning_y = geo["center_y"] - inning_tri_size // 2
+            self._draw_inning(image, right_x0 + 1, inning_y, game)
+
+            outs_cx = right_x0 + right_w - 3 - outs_diameter // 2
+            self._draw_outs(draw, outs_cx, geo["center_y"], game, diameter=outs_diameter, gap=1)
+
+            # --- Bottom row: count + batter, unchanged ---
             count_text = f"{game['balls']}-{game['strikes']}"
             self._draw_count(image, right_x0 + 1, lower_y, game)
 
@@ -988,6 +1064,10 @@ class TidbytBaseballPlugin(BasePlugin):
         )
 
     @staticmethod
+    def _darken_color(color: Tuple[int, int, int], min_channel: int = 15) -> Tuple[int, int, int]:
+        return tuple(max(c // 2, min_channel) for c in color)
+
+    @staticmethod
     def _text_color_for(bg: Tuple[int, int, int]) -> Tuple[int, int, int]:
         luminance = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
         return (0, 0, 0) if luminance > 150 else (255, 255, 255)
@@ -1038,13 +1118,32 @@ class TidbytBaseballPlugin(BasePlugin):
             image.paste(logo, (logo_x, logo_y), logo)
 
         bar_y0 = y0 + h - bar_h
-        bar_color = tuple(max(c // 2, 15) for c in bg_color)
+        bar_color = bg_color  # swapped: bright team color now backs the text, not the logo
         draw.rectangle([x0, bar_y0, x0 + w - 1, y0 + h - 1], fill=bar_color)
 
         tx = x0 + max((w - line_w) // 2, 0)
         tx = min(tx, x0 + w - line_w) if line_w < w else x0
         ty = bar_y0 + max((bar_h - line_h) // 2, 0) - line_bbox[1]
         self._render_text(image, (tx, ty), text_line, font, text_color)
+
+    def _diamond_geometry(self, x, y, w, h):
+        """Single source of truth for the diamond's size/position math,
+        shared between _draw_diamond (drawing it) and display() (which
+        needs to know its actual center to align the inning/outs
+        indicators next to it)."""
+        cx = x + w // 2
+        max_half_by_height = max((h - 2) // 3, 3)
+        max_half_by_width = max((w - 6) // 2, 3)
+        half = max(min(max_half_by_height, max_half_by_width), 3)
+        top_y = y + half + 1
+        bottom_y = top_y + half + 2
+        left_x = cx - half - 3 - half   # leftmost point (third base tip)
+        right_x = cx + half + 3 + half  # rightmost point (first base tip)
+        center_y = (top_y + bottom_y) // 2
+        return {
+            "cx": cx, "half": half, "top_y": top_y, "bottom_y": bottom_y,
+            "left_x": left_x, "right_x": right_x, "center_y": center_y,
+        }
 
     def _draw_diamond(self, draw, x, y, w, h, game):
         """`h` is the actual vertical space available for the whole
@@ -1058,13 +1157,8 @@ class TidbytBaseballPlugin(BasePlugin):
         unoccupied-base outline is an exact 1px line -- running it
         through the supersample/downsample anti-aliasing helper was
         blurring that 1px line into something that reads as thicker."""
-        cx = x + w // 2
-        max_half_by_height = max((h - 2) // 3, 3)
-        max_half_by_width = max((w - 6) // 2, 3)
-        half = max(min(max_half_by_height, max_half_by_width), 3)
-
-        top_y = y + half + 1
-        bottom_y = top_y + half + 2
+        geo = self._diamond_geometry(x, y, w, h)
+        cx, half, top_y, bottom_y = geo["cx"], geo["half"], geo["top_y"], geo["bottom_y"]
 
         positions = {
             "second": (cx, top_y),
@@ -1122,6 +1216,50 @@ class TidbytBaseballPlugin(BasePlugin):
         count_text = f"{game['balls']}-{game['strikes']}"
         self._render_text(image, (x, y), count_text, self.font_count, (255, 200, 0))
 
+    def _draw_pitch_info(self, image, draw, x, y, max_width, pitch_count, pitcher_name, pitcher_short_name):
+        """Draws 'P:<count> <Pitcher Name>' at the top of the black
+        half. Returns the pixel height actually used, so the caller can
+        position the diamond right below it regardless of font metrics.
+
+        IMPORTANT CAVEAT: real live-game data already captured for this
+        plugin shows ESPN's scoreboard situation.pitcher object doesn't
+        appear to include a pitch-count field at all (see
+        extract_pitch_count's docstring in _parse_game). If pitch_count
+        never populates for you, that's most likely ESPN's lightweight
+        scoreboard endpoint simply not exposing it -- getting a reliable
+        live pitch count would likely need an extra per-game API call
+        to ESPN's more detailed boxscore/summary endpoint. Let me know
+        if you want that added; it's an extra request per game per poll
+        rather than a quick fix.
+
+        If there's no pitcher name at all, draws nothing and returns 0
+        so the diamond simply moves up to fill the freed space."""
+        if not pitcher_name and not pitcher_short_name:
+            return 0
+
+        name = pitcher_short_name or self._format_batter_name(pitcher_name)
+        text = f"P:{pitch_count} {name}" if pitch_count is not None else name
+
+        font = self._fit_font_for_width(draw, text, max_width, start_size=7, min_size=4)
+        bbox = self._measure(font, text)
+        text_to_draw = text
+        if bbox[2] - bbox[0] > max_width:
+            truncated = text
+            text_to_draw = None
+            while truncated:
+                candidate = truncated + "."
+                cbbox = self._measure(font, candidate)
+                if cbbox[2] - cbbox[0] <= max_width:
+                    text_to_draw = candidate
+                    break
+                truncated = truncated[:-1]
+            if text_to_draw is None:
+                return 0
+
+        self._render_text(image, (x, y), text_to_draw, font, (180, 180, 220))
+        final_bbox = self._measure(font, text_to_draw)
+        return final_bbox[3] - final_bbox[1]
+
     def _draw_batter(self, image, draw, x, y, max_width, batter_name, batter_short_name=None):
         """Draws whoever is currently at bat, shrunk to fit whatever
         width remains next to the count.
@@ -1164,15 +1302,17 @@ class TidbytBaseballPlugin(BasePlugin):
 
         self._render_text(image, (x, y), text_to_draw, font, (200, 200, 200))
 
-    def _draw_outs(self, draw, x, y, w, game):
-        square = 3
-        gap = 2
-        edge_margin = 3
-        base_x = x + w - edge_margin - (square + gap) * 3 + gap
+    def _draw_outs(self, draw, cx, center_y, game, diameter=4, gap=2):
+        """Vertically stacked circles (top to bottom = out 1, 2, 3),
+        centered on `center_y` -- filled when recorded, 1px outline
+        when not. `cx` is the horizontal center to align all three on."""
+        radius = diameter // 2
+        total_h = diameter * 3 + gap * 2
+        top = center_y - total_h // 2
         for i in range(3):
-            sx = base_x + i * (square + gap)
-            box = [sx, y + 1, sx + square, y + 1 + square]
+            cy = top + radius + i * (diameter + gap)
+            box = [cx - radius, cy - radius, cx + radius, cy + radius]
             if i < game["outs"]:
-                draw.rectangle(box, fill=self.out_fill_color)
+                draw.ellipse(box, fill=self.out_fill_color)
             else:
-                draw.rectangle(box, outline=self.out_empty_color)
+                draw.ellipse(box, outline=self.out_empty_color, width=1)
