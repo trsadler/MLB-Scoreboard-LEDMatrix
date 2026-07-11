@@ -219,6 +219,11 @@
       "default": 10,
       "minimum": 1,
       "description": "How long the home run animation plays, independent of last_play_display_seconds -- the 3-phase animation (ball arc, strobe, fireworks+scrolling text) needs more time than a plain text flash to play out fully."
+    },
+    "last_play_favorites_only": {
+      "type": "boolean",
+      "default": false,
+      "description": "Restrict the last-play flash/interrupt system to favorite-team games only, independent of overall rotation scope. Useful when show_favorite_teams_only is off (all live games rotate normally) but you only want YOUR team's big moments to interrupt that rotation, not every other simultaneous game's."
     }
   },
   "required": [

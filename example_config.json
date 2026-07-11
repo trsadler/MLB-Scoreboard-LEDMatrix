@@ -21,6 +21,7 @@
     "last_play_display_seconds": 5,
     "home_run_display_seconds": 10,
     "last_play_filter": "significant",
+    "last_play_favorites_only": false,
     "show_past_games": false,
     "show_upcoming_games": false,
     "max_past_games": 3,

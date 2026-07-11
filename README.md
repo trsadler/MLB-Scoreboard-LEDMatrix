@@ -216,6 +216,52 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: box score characters looked scattered/off-center
+
+**Root cause confirmed by directly comparing measured vs. actually
+rendered ink pixels**: the centering math used the font's measured
+width, which includes the glyph's trailing advance spacing (`DWIDTH`),
+not just its actual ink (`BBX`) -- e.g. "0" measures 4px wide but its
+real ink is only 3px. Centering against the inflated width
+systematically shifted every digit left, and by an amount that varied
+between -1px and -2px depending on each cell's specific width (since
+the phantom extra pixel interacts differently with integer rounding at
+different widths) -- which is exactly what "scattered" looks like:
+not a uniform shift, an inconsistent one.
+
+**Fixed** by centering against the actual rendered ink extent instead
+(reusing `_ink_extent`, built earlier for a different fix) rather than
+the advance-inclusive measurement. Verified by measuring every cell's
+ink-center vs. its true geometric center before and after: offsets
+went from wildly inconsistent (-1.0 to -2.0px, different per cell) to
+tight and uniform (-1.0px, occasionally -0.5px). The remaining
+sub-pixel residual is a genuine floor -- individual digits have
+different actual ink widths (e.g. "1" is narrower than "0"), and
+perfectly centering both parities of ink-width/cell-width combinations
+simultaneously isn't possible with integer pixels -- but a consistent
+~1px lean reads as intentional rather than scattered.
+
+## New: restrict the last-play flash to favorite teams independent of rotation scope
+
+Diagnosed the "jumping around a lot" report before changing anything:
+with `show_favorite_teams_only` off and 5+ simultaneous live games (as
+confirmed), normal rotation itself is calm (a predictable
+`game_rotation_seconds`-paced cycle), but the last-play flash can
+interrupt it for ANY of those games' significant plays -- and the
+aggregate rate of hits/walks/strikeouts/runs across 5+ games
+simultaneously is high enough that the flash fires very often,
+compounding with rotation to feel like constant jumping even though
+each individual mechanism is working as designed.
+
+Added `last_play_favorites_only` (default off, opt-in) as a setting
+independent of overall rotation scope: normal rotation still cycles
+through every live game exactly as before, but the flash-interrupt
+only fires for your own favorite team's plays. Tested directly:
+confirmed a non-favorite game's significant play no longer queues a
+flash when enabled, a favorite team's still does, and the default
+(off) behavior is completely unchanged for anyone who wants the
+original all-games-can-flash behavior.
+
 ## Pitch count: fixed a real cross-endpoint consistency bug
 
 "Accurate for some games, not others" pointed at something

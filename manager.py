@@ -420,6 +420,7 @@ class TidbytBaseballPlugin(BasePlugin):
         self.last_play_display_seconds = cfg.get("last_play_display_seconds", 5)
         self.home_run_display_seconds = cfg.get("home_run_display_seconds", 10)
         self.last_play_filter = cfg.get("last_play_filter", "significant")
+        self.last_play_favorites_only = cfg.get("last_play_favorites_only", False)
         self.show_past_games = cfg.get("show_past_games", False)
         self.show_upcoming_games = cfg.get("show_upcoming_games", False)
         self.max_past_games = cfg.get("max_past_games", 3)
@@ -960,6 +961,24 @@ class TidbytBaseballPlugin(BasePlugin):
                 self.last_play_filter != "significant"
                 or play_type not in NON_SIGNIFICANT_PLAY_TYPES
             )
+
+            # Independent of rotation scope: even with all leaguewide
+            # live games rotating normally, this restricts which games
+            # are allowed to INTERRUPT that rotation with a flash. With
+            # several simultaneous games, the aggregate rate of
+            # significant plays across all of them can make the display
+            # feel like it's jumping around constantly even though
+            # rotation itself is calm -- this lets someone keep seeing
+            # every live game in rotation while only getting interrupted
+            # for their own team's moments.
+            if self.last_play_favorites_only:
+                involves_favorite = (
+                    game.get("away_abbr") in self.favorite_teams
+                    or game.get("home_abbr") in self.favorite_teams
+                )
+                if not involves_favorite:
+                    is_significant = False
+
             if is_significant:
                 already_active = self._active_flash and self._active_flash.get("event_id") == event_id
                 already_pending = event_id in self._pending_flash_event_ids
@@ -2109,8 +2128,22 @@ class TidbytBaseballPlugin(BasePlugin):
             if text:
                 w, h = x1 - x0, y1 - y0
                 bbox = self._measure(font, text)
-                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                tx = x0 + max((w - tw) // 2, 0)
+                th = bbox[3] - bbox[1]
+                # IMPORTANT: centering horizontally using _measure's width
+                # was confirmed wrong -- that width includes the glyph's
+                # trailing advance spacing (DWIDTH), not just its ink
+                # (BBX). Confirmed by direct pixel comparison: "0" measures
+                # 4px wide but its actual ink is only 3px, so centering
+                # against the measured width consistently drifted the ink
+                # left by an amount that varied with cell width (since the
+                # 1px of phantom trailing space shifts the centering math
+                # differently depending on integer rounding at each
+                # width) -- exactly the "scattered" look reported.
+                # _ink_extent measures real rendered ink instead.
+                ink_left, ink_right = self._ink_extent(font, text)
+                ink_w = ink_right - ink_left + 1
+                target_ink_x0 = x0 + max((w - ink_w) // 2, 0)
+                tx = target_ink_x0 - ink_left + 3  # +3 undoes _ink_extent's internal scratch-render offset
                 ty = y0 + max((h - th) // 2, 0) - bbox[1]
                 self._render_text(image, (tx, ty), text, font, color)
 
