@@ -216,6 +216,53 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Pitch count: fixed a real cross-endpoint consistency bug
+
+"Accurate for some games, not others" pointed at something
+game-specific rather than a logic bug, and there was a real one: the
+pitcher's *name* on screen comes from the scoreboard endpoint, but
+pitch-count enrichment separately re-derived the pitcher's *id* from a
+different endpoint (the summary call), fetched at a slightly different
+moment. If a pitching change happened in between those two fetches --
+which occurs multiple times per game -- the count could end up
+computed for a different pitcher than the one whose name was actually
+displayed. That would show an accurate-looking name next to a wrong
+count, and only for games where the timing happened to line up badly.
+
+**Fixed** by capturing the pitcher's id alongside their name at
+extraction time (same fetch, same moment), and having pitch-count
+enrichment prefer that id over re-deriving one from the separately-timed
+summary endpoint. Tested the exact failure scenario: a game dict
+carrying one pitcher's id (matching the displayed name) while the
+summary endpoint's own situation snapshot already shows a different
+pitcher (simulating a change that happened between fetches) --
+confirmed the count now correctly reflects the displayed pitcher, not
+the stale/different one from the second endpoint.
+
+## New: box score polish -- thinner grid lines, narrower E column
+
+Two visual fixes:
+
+- **Grid lines were genuinely 2px thick, not 1px** -- confirmed by
+  direct pixel sampling: each cell independently drew its own full
+  border, so two adjacent cells' borders sat immediately next to (not
+  on top of) each other at every internal boundary. Rewrote to draw
+  each internal divider ONCE as a unified single-pixel line spanning
+  the whole table, instead of per-cell. Freed-up space goes toward
+  slightly more room for the cells themselves, per your call to
+  sacrifice stroke width for cell space if needed.
+- **E (errors) no longer gets the wide double-digit treatment** -- per
+  the (very reasonable) observation that a double-digit error total is
+  essentially never going to happen in real MLB. Only R and H keep the
+  wider columns now; E is back to inning-column width, and that
+  reclaimed space goes to R/H and the inning columns instead.
+
+Verified with direct pixel sampling: both row and column dividers now
+show exactly one grid-line-colored pixel where there were two before;
+zero unexpected/black pixels anywhere in the box score area; and the
+double-digit R column still fully contains "10" without overflowing
+under the new width allocation.
+
 ## Pitch count: fixed a likely undercounting bug, made counting robust to unknown types
 
 Still not accurate after the first rebuild, and re-examining what I'd

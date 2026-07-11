@@ -1103,7 +1103,18 @@ class TidbytBaseballPlugin(BasePlugin):
         Falls back to the old boxscore-search approach afterward in
         case some other context does expose a direct field, but that's
         no longer the primary strategy since it's confirmed to not
-        exist in the common case."""
+        exist in the common case.
+
+        IMPORTANT: prefers `game["pitcher_id"]` (extracted from the same
+        scoreboard fetch that determined the pitcher NAME currently
+        displayed) over re-deriving an id from this separately-fetched
+        summary endpoint. Those two fetches happen at slightly
+        different times -- if a pitching change occurs in between, the
+        re-derived id could reference a DIFFERENT pitcher than the one
+        whose name is on screen, showing an accurate-looking name next
+        to a pitch count for someone else entirely. Using the same id
+        throughout guarantees the name and count always refer to the
+        same person."""
         event_id = game.get("event_id")
         if not event_id:
             return
@@ -1112,16 +1123,17 @@ class TidbytBaseballPlugin(BasePlugin):
         resp.raise_for_status()
         data = resp.json()
 
-        pitcher_id = None
-        try:
-            for comp in data.get("header", {}).get("competitions", []):
-                situation = comp.get("situation", {})
-                pid = situation.get("pitcher", {}).get("playerId") or situation.get("pitcher", {}).get("athlete", {}).get("id")
-                if pid:
-                    pitcher_id = str(pid)
-                    break
-        except Exception:
-            pass
+        pitcher_id = game.get("pitcher_id")
+        if not pitcher_id:
+            try:
+                for comp in data.get("header", {}).get("competitions", []):
+                    situation = comp.get("situation", {})
+                    pid = situation.get("pitcher", {}).get("playerId") or situation.get("pitcher", {}).get("athlete", {}).get("id")
+                    if pid:
+                        pitcher_id = str(pid)
+                        break
+            except Exception:
+                pass
 
         # situation.pitcher can be empty during brief state transitions
         # (confirmed: happened in real diagnostic output caught between
@@ -1564,14 +1576,19 @@ class TidbytBaseballPlugin(BasePlugin):
         def extract_pitcher_info(situation_dict):
             """Same shape as the batter extraction, confirmed against
             the same real live-game data: situation.pitcher.athlete.
-            {displayName, fullName, shortName}."""
+            {displayName, fullName, shortName}. Also captures the
+            pitcher's id -- needed so pitch-count enrichment can use
+            the SAME pitcher this name was extracted for, rather than
+            re-deriving an id from a separately-fetched endpoint that
+            could reflect a pitching change that happened in between."""
             try:
                 athlete = situation_dict.get("pitcher", {}).get("athlete", {})
                 full = athlete.get("displayName") or athlete.get("fullName")
                 short = athlete.get("shortName")
-                return full, short
+                pid = situation_dict.get("pitcher", {}).get("playerId") or athlete.get("id")
+                return full, short, (str(pid) if pid else None)
             except Exception:
-                return None, None
+                return None, None, None
 
         def extract_pitch_count(situation_dict):
             """NOTE: the real live-game JSON already captured for this
@@ -1615,7 +1632,7 @@ class TidbytBaseballPlugin(BasePlugin):
                 return None, None, None
 
         batter_full, batter_short = extract_batter_info(situation)
-        pitcher_full, pitcher_short = extract_pitcher_info(situation)
+        pitcher_full, pitcher_short, pitcher_id = extract_pitcher_info(situation)
         pitch_count = extract_pitch_count(situation)
         last_play_id, last_play_text, last_play_type = extract_last_play(situation)
         game_date_str, game_time_str = self._format_game_datetime(event)
@@ -1655,6 +1672,7 @@ class TidbytBaseballPlugin(BasePlugin):
             "batter_short_name": batter_short,
             "pitcher_name": pitcher_full,
             "pitcher_short_name": pitcher_short,
+            "pitcher_id": pitcher_id,
             "pitch_count": pitch_count,
             "event_id": event.get("id"),
             "last_play_id": last_play_id,
@@ -2050,15 +2068,17 @@ class TidbytBaseballPlugin(BasePlugin):
         # value -- confirmed by direct measurement that "10" needs 8px
         # of ink, but an equal-width column here is only 6-7px total
         # (borders included), so it always overflowed into the next
-        # cell. R/H/E (game totals) realistically reach double digits
-        # far more often than any single inning does (a team scoring
-        # 10+ runs in ONE inning is exceptionally rare in real MLB), so
-        # R/H/E columns get extra weight at the expense of slightly
-        # narrower inning columns, which only need to comfortably fit a
-        # single digit in the overwhelming majority of real games.
+        # cell. R/H (game totals) realistically reach double digits far
+        # more often than any single inning does (a team scoring 10+
+        # runs in ONE inning is exceptionally rare in real MLB), so R/H
+        # columns get extra weight at the expense of slightly narrower
+        # inning columns. E stays narrow (same weight as innings) --
+        # per explicit call: a double-digit error total is essentially
+        # never going to happen, so it doesn't need the wide treatment
+        # and that space is better spent elsewhere.
         weight_inning = 1.0
-        weight_rhe = 1.8
-        weights = [weight_inning] * num_innings + [weight_rhe] * extra_cols
+        weight_wide = 1.8   # R, H
+        weights = [weight_inning] * num_innings + [weight_wide, weight_wide, weight_inning]
         total_weight = sum(weights)
         cum_weight = [0.0]
         for w in weights:
@@ -2072,8 +2092,20 @@ class TidbytBaseballPlugin(BasePlugin):
 
         font = self.font_tiny
 
+        # Draw grid lines ONCE as unified single-pixel lines spanning the
+        # whole table, rather than having each cell independently draw
+        # its own full border -- confirmed by direct pixel sampling that
+        # doing it per-cell doubles every INTERNAL divider to 2px thick
+        # (each of two adjacent cells draws its own separate 1px border
+        # immediately next to, not on top of, the other's). Only draw
+        # INTERNAL boundaries (skip the outer edge, which is already the
+        # panel/background edge and doesn't need a redundant stroke).
+        for cx in col_bounds[1:-1]:
+            draw.line([(cx, header_y0), (cx, home_y1 - 1)], fill=GRID_LINE)
+        for cy in row_bounds[1:-1]:
+            draw.line([(right_x0, cy), (right_x0 + right_w - 1, cy)], fill=GRID_LINE)
+
         def draw_cell(x0, x1, y0, y1, text, color=TEXT_COLOR):
-            draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=GRID_LINE)
             if text:
                 w, h = x1 - x0, y1 - y0
                 bbox = self._measure(font, text)
