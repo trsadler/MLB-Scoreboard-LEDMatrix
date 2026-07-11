@@ -216,6 +216,30 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Box score: exact 1px padding per spec, investigated missing data
+
+**Replaced proportional/weighted column widths with exact fixed
+widths**, computed directly from measured ink rather than distributing
+available space: inning and E columns are `3px ink + 1px padding each
+side = 5px` exactly; R/H are `7px ink (measured for a real two-digit
+combo like "10") + 1px padding each side = 9px`. Verified with direct
+pixel measurement: every column -- inning, R, H, and E alike -- now
+shows exactly 1px of padding on both sides, not the inconsistent 1-3px
+that fell out of the previous weighted/proportional approach. The
+grid is narrower than the full available width as a result (68px
+total); the remaining space stays plain green background, confirmed
+via pixel sampling that it's genuinely green, not black.
+
+**Investigated the missing 9th-inning box** (ATL@STL): the most likely
+explanation is a real baseball/box-score convention, not a bug --
+traditional box scores leave a half-inning's box blank (not "0") when
+a team didn't bat there, e.g. the home team winning without needing
+the bottom of the 9th. Added diagnostic logging that fires whenever
+the two teams' linescore array lengths genuinely differ, logging both
+raw arrays so this can be confirmed against real data rather than
+assumed. Verified the logging fires correctly against a reconstructed
+walk-off scenario.
+
 ## Fixed for real this time: box score cross-row misalignment + logo bleed
 
 Still looked scattered after the previous ink-based centering fix, so

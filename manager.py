@@ -2072,45 +2072,54 @@ class TidbytBaseballPlugin(BasePlugin):
         away_ls = game.get("away_linescores") or []
         home_ls = game.get("home_linescores") or []
         num_innings = max(9, len(away_ls), len(home_ls))
-        # Guard against a very long extra-innings game making cells
-        # unreadably small -- cap displayed innings based on available
-        # width so cells never shrink below a legible floor, rather
-        # than a fixed cap regardless of space.
-        extra_cols = 3  # R, H, E
-        min_cell_w = 4
-        max_innings_that_fit = max(right_w // min_cell_w - extra_cols, 1)
-        num_innings = min(num_innings, max_innings_that_fit, 12)
-        total_cols = num_innings + extra_cols
 
-        # IMPORTANT: using a fixed cell_w = right_w // total_cols (floor
-        # division) leaves a few leftover pixels unaccounted for at the
-        # right edge -- still the same FENWAY_GREEN underneath, but with
-        # no grid lines there, it visually reads as a separate darker
-        # border strip rather than part of the table. Cumulative
-        # boundaries instead guarantee the grid spans the FULL right_w
-        # exactly, distributing any rounding slack across columns
-        # instead of dumping it all in one unused strip.
-        #
-        # ALSO IMPORTANT: equal-width columns broke for any double-digit
-        # value -- confirmed by direct measurement that "10" needs 8px
-        # of ink, but an equal-width column here is only 6-7px total
-        # (borders included), so it always overflowed into the next
-        # cell. R/H (game totals) realistically reach double digits far
-        # more often than any single inning does (a team scoring 10+
-        # runs in ONE inning is exceptionally rare in real MLB), so R/H
-        # columns get extra weight at the expense of slightly narrower
-        # inning columns. E stays narrow (same weight as innings) --
-        # per explicit call: a double-digit error total is essentially
-        # never going to happen, so it doesn't need the wide treatment
-        # and that space is better spent elsewhere.
-        weight_inning = 1.0
-        weight_wide = 1.8   # R, H
-        weights = [weight_inning] * num_innings + [weight_wide, weight_wide, weight_inning]
-        total_weight = sum(weights)
-        cum_weight = [0.0]
-        for w in weights:
-            cum_weight.append(cum_weight[-1] + w)
-        col_bounds = [right_x0 + round(cw / total_weight * right_w) for cw in cum_weight]
+        # Investigate missing data: if the two teams' linescores arrays
+        # are different lengths, log it so we can tell from real data
+        # whether that's a genuine ESPN convention (traditionally, a
+        # box score leaves a half-inning's box BLANK -- not "0" -- when
+        # a team didn't bat there, e.g. the home team winning without
+        # needing the bottom of the 9th) versus an actual extraction
+        # bug losing a real data point.
+        if away_ls and home_ls and len(away_ls) != len(home_ls):
+            self.logger.info(
+                f"Box score linescore length mismatch for "
+                f"{game.get('away_abbr')}@{game.get('home_abbr')}: "
+                f"away has {len(away_ls)} innings {away_ls}, home has "
+                f"{len(home_ls)} innings {home_ls}. If a box shows blank "
+                f"where you expected a real value, this is why -- ESPN's "
+                f"own data has fewer entries for that team, most likely "
+                f"because they didn't bat in that half-inning (traditional "
+                f"box scores leave that blank, not zero) rather than a bug "
+                f"here dropping a real value."
+            )
+
+        # Exact fixed widths based on measured ink + exactly 1px padding
+        # on each side, per explicit spec -- inning columns and E only
+        # ever need to fit a single digit (3px ink, confirmed uniform
+        # across all digits after the earlier "1" glyph widening), so
+        # 3 + 1 + 1 = 5px. R/H need to comfortably fit double digits
+        # (7px ink for two digits side by side, measured directly) plus
+        # the same 1px padding each side = 9px -- "slightly wider" per
+        # request, since double-digit runs/hits are realistic but
+        # double-digit errors essentially never happen.
+        single_digit_ink_w = 3
+        double_digit_ink_w = 7
+        pad = 1
+        inning_col_w = single_digit_ink_w + pad * 2   # 5
+        wide_col_w = double_digit_ink_w + pad * 2     # 9
+        e_col_w = single_digit_ink_w + pad * 2         # 5, same as innings
+
+        # Cap displayed innings based on available width so a very long
+        # extra-innings game can't push the grid past the panel edge,
+        # rather than a fixed cap regardless of space.
+        fixed_extra_w = wide_col_w * 2 + e_col_w
+        max_innings_that_fit = max((right_w - fixed_extra_w) // inning_col_w, 1)
+        num_innings = min(num_innings, max_innings_that_fit, 12)
+
+        col_widths = [inning_col_w] * num_innings + [wide_col_w, wide_col_w, e_col_w]
+        col_bounds = [right_x0]
+        for cw in col_widths:
+            col_bounds.append(col_bounds[-1] + cw)
         row_bounds = [round(i * height / 3) for i in range(4)]
 
         header_y0, header_y1 = row_bounds[0], row_bounds[1]
