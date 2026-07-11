@@ -1166,28 +1166,42 @@ class TidbytBaseballPlugin(BasePlugin):
 
     def _count_pitches_for_pitcher(self, plays: List[Dict[str, Any]], pitcher_id: str) -> Optional[int]:
         """Counts real pitches thrown by `pitcher_id` across the whole
-        game, confirmed against real ESPN play-by-play structure
-        (2026-07-11): each individual pitch is a distinct entry with
-        `type.type == "play-result"`; the pitcher who threw it is
-        identified via `participants: [{"athlete": {"id": ...}, "type":
-        "pitcher"}, ...]`.
+        game.
 
-        IMPORTANT: the entry immediately after each at-bat's final pitch
-        ("End Batter/Pitcher", type.type == "end-batterpitcher") repeats
-        that same pitch's atBatPitchNumber -- confirmed via real data
-        that this is a duplicate bookkeeping marker, not a new pitch.
-        Filtering strictly to "play-result" avoids double-counting it."""
+        REVISED after real data showed the first version was likely
+        undercounting: that version filtered strictly to
+        `type.type == "play-result"`, confirmed present on the FINAL
+        pitch of an at-bat (a strikeout call) -- but never actually
+        confirmed against an INTERMEDIATE pitch (a ball or a strike that
+        doesn't end the at-bat). If those use a different type value
+        (quite plausible -- ESPN's play-by-play often tags "Ball"/
+        "Strike Looking" etc as their own distinct type rather than
+        nested under a generic "play-result"), that filter would have
+        only counted one pitch per at-bat faced, not the real total --
+        producing a count far too low.
+
+        Fixed by not depending on any type value at all: every pitch
+        (confirmed from real data) carries an `atBatId` + a
+        sequential `atBatPitchNumber` within that at-bat, whether it's
+        an intermediate pitch or the final one. Counting DISTINCT
+        (atBatId, atBatPitchNumber) pairs attributed to the pitcher
+        naturally collapses any duplicate bookkeeping entries for the
+        same pitch (like the confirmed "End Batter/Pitcher" duplicate
+        of the final pitch) to a single count, without needing to know
+        or guess which type values are "real" vs duplicates."""
         if not plays:
             return None
-        count = 0
+        seen_pitches = set()
         for p in plays:
-            if p.get("type", {}).get("type") != "play-result":
+            pitch_num = p.get("atBatPitchNumber")
+            at_bat_id = p.get("atBatId")
+            if pitch_num is None or at_bat_id is None:
                 continue
             for part in p.get("participants", []):
                 if part.get("type") == "pitcher" and str(part.get("athlete", {}).get("id")) == pitcher_id:
-                    count += 1
+                    seen_pitches.add((at_bat_id, pitch_num))
                     break
-        return count if count > 0 else None
+        return len(seen_pitches) if seen_pitches else None
 
     def _find_pitch_count(self, data: Any, pitcher_id: Optional[str]) -> Optional[int]:
         """Tries a couple of specific plausible paths first (boxscore

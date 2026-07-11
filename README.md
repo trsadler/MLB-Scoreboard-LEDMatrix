@@ -216,6 +216,34 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Pitch count: fixed a likely undercounting bug, made counting robust to unknown types
+
+Still not accurate after the first rebuild, and re-examining what I'd
+actually confirmed revealed a real gap: I'd only confirmed
+`type.type == "play-result"` on the FINAL pitch of an at-bat (a
+strikeout call) -- never on an intermediate ball or strike that
+doesn't end the at-bat. If those use a different type value (quite
+plausible for ESPN's play-by-play), filtering strictly to
+`"play-result"` would only count one pitch per at-bat *faced*, not the
+real per-pitch total -- a count far too low, and consistent with
+"still not accurate."
+
+**Fixed by removing the dependency on any type value at all.** Every
+pitch (confirmed from real data, both terminal and intermediate)
+carries an `atBatId` plus a sequential `atBatPitchNumber`. Counting
+DISTINCT `(atBatId, atBatPitchNumber)` pairs attributed to the pitcher
+naturally collapses duplicate bookkeeping entries (like the confirmed
+"End Batter/Pitcher" repeat of the final pitch) to a single count,
+without needing to know or guess which type values represent "real"
+pitches versus duplicates.
+
+Tested against the exact ambiguity that caused the bug: a 3-pitch
+at-bat using three different type values for each pitch (ball,
+strike-looking, play-result) plus the confirmed duplicate marker --
+correctly counts 3, not 1 (the undercounting bug) and not 4 (double-
+counting the duplicate). Also verified across a full multi-at-bat game
+(4+3+5 pitches across three at-bats) sums correctly to 12.
+
 ## Fixed: double-digit numbers overflowing box score cells
 
 **Confirmed by direct measurement**: "10" needs 8px of ink width, but
