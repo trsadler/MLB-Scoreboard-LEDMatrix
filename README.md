@@ -216,6 +216,32 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: dark unfilled border around the box score
+
+**Root cause wasn't the grid math** -- it was how `right_w` itself was
+computed. The formula `width - right_x0 - 1` (used consistently across
+all three game-type layouts) deliberately leaves the very last pixel
+column unaccounted for; on the live/upcoming layouts that 1px never
+gets touched by anything so it just stays background-colored and
+unnoticed, but on the box score it meant that column was never filled
+with the green background at all -- still plain black, which read as a
+dark border along the right edge.
+
+Also switched the grid from a fixed cell width (`right_w // total_cols`,
+floor division) to exact cumulative column/row boundaries, so the grid
+spans the *entire* available space with no leftover remainder pixels
+either -- distributing any rounding slack across cells instead of
+dumping it all into one unused strip. As a side effect, cells came out
+very slightly larger on average (6-7px instead of a flat 6px).
+
+Verified concretely, not just visually: sampled the actual pixel color
+at the true right edge (x=127) before and after the fix -- was
+unfilled black, now correctly grid-green -- and scanned the entire box
+score area for any pixel that wasn't one of the four expected colors
+(background, grid line, text, winner-highlight). Found 32 stray
+pixels before the fix (exactly one column's worth, 32 rows tall --
+matching the missing-column theory precisely), zero after.
+
 ## New: traditional green box score for final games
 
 Kept the left-half team columns (logo/abbreviation/score, same as the

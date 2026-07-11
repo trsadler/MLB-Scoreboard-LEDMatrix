@@ -1898,7 +1898,11 @@ class TidbytBaseballPlugin(BasePlugin):
         draw.rectangle([left_w, 0, left_w, height - 1], fill=(166, 166, 166))
 
         right_x0 = left_w + 2
-        right_w = width - right_x0 - 1
+        # Unlike the live/upcoming layouts, this extends all the way to
+        # the true panel edge (no "-1" reserve) -- that reserved pixel
+        # was left unfilled/black, which is exactly the "dark border"
+        # visible on the right edge of the box score.
+        right_w = width - right_x0
 
         FENWAY_GREEN = (13, 46, 33)
         GRID_LINE = (70, 100, 85)
@@ -1918,20 +1922,30 @@ class TidbytBaseballPlugin(BasePlugin):
         min_cell_w = 4
         max_innings_that_fit = max(right_w // min_cell_w - extra_cols, 1)
         num_innings = min(num_innings, max_innings_that_fit, 12)
-
         total_cols = num_innings + extra_cols
-        cell_w = max(right_w // total_cols, min_cell_w)
 
-        row_h = height // 3
-        header_y = 0
-        away_y = row_h
-        home_y = row_h * 2
+        # IMPORTANT: using a fixed cell_w = right_w // total_cols (floor
+        # division) leaves a few leftover pixels unaccounted for at the
+        # right edge -- still the same FENWAY_GREEN underneath, but with
+        # no grid lines there, it visually reads as a separate darker
+        # border strip rather than part of the table. Cumulative
+        # boundaries instead guarantee the grid spans the FULL right_w
+        # exactly, distributing any rounding slack across columns
+        # instead of dumping it all in one unused strip -- and as a
+        # side effect, cells end up very slightly larger on average.
+        col_bounds = [right_x0 + round(i * right_w / total_cols) for i in range(total_cols + 1)]
+        row_bounds = [round(i * height / 3) for i in range(4)]
+
+        header_y0, header_y1 = row_bounds[0], row_bounds[1]
+        away_y0, away_y1 = row_bounds[1], row_bounds[2]
+        home_y0, home_y1 = row_bounds[2], row_bounds[3]
 
         font = self.font_tiny
 
-        def draw_cell(x0, y0, w, h, text, color=TEXT_COLOR):
-            draw.rectangle([x0, y0, x0 + w - 1, y0 + h - 1], outline=GRID_LINE)
+        def draw_cell(x0, x1, y0, y1, text, color=TEXT_COLOR):
+            draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=GRID_LINE)
             if text:
+                w, h = x1 - x0, y1 - y0
                 bbox = self._measure(font, text)
                 tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
                 tx = x0 + max((w - tw) // 2, 0)
@@ -1939,29 +1953,25 @@ class TidbytBaseballPlugin(BasePlugin):
                 self._render_text(image, (tx, ty), text, font, color)
 
         # Header row: inning numbers, then R/H/E labels
-        x = right_x0
         for i in range(num_innings):
-            draw_cell(x, header_y, cell_w, row_h, str(i + 1))
-            x += cell_w
-        for label in ("R", "H", "E"):
-            draw_cell(x, header_y, cell_w, row_h, label)
-            x += cell_w
+            draw_cell(col_bounds[i], col_bounds[i + 1], header_y0, header_y1, str(i + 1))
+        for j, label in enumerate(("R", "H", "E")):
+            idx = num_innings + j
+            draw_cell(col_bounds[idx], col_bounds[idx + 1], header_y0, header_y1, label)
 
-        def draw_team_row(y0, linescores, score, hits, errors, won):
+        def draw_team_row(y0, y1, linescores, score, hits, errors, won):
             row_color = WIN_COLOR if won else TEXT_COLOR
-            x = right_x0
             for i in range(num_innings):
                 val = linescores[i] if i < len(linescores) else None
-                draw_cell(x, y0, cell_w, row_h, str(val) if val is not None else "")
-                x += cell_w
-            draw_cell(x, y0, cell_w, row_h, str(score), color=row_color)
-            x += cell_w
-            draw_cell(x, y0, cell_w, row_h, str(hits) if hits is not None else "", color=row_color)
-            x += cell_w
-            draw_cell(x, y0, cell_w, row_h, str(errors) if errors is not None else "", color=row_color)
+                draw_cell(col_bounds[i], col_bounds[i + 1], y0, y1, str(val) if val is not None else "")
+            draw_cell(col_bounds[num_innings], col_bounds[num_innings + 1], y0, y1, str(score), color=row_color)
+            draw_cell(col_bounds[num_innings + 1], col_bounds[num_innings + 2], y0, y1,
+                      str(hits) if hits is not None else "", color=row_color)
+            draw_cell(col_bounds[num_innings + 2], col_bounds[num_innings + 3], y0, y1,
+                      str(errors) if errors is not None else "", color=row_color)
 
-        draw_team_row(away_y, away_ls, game["away_score"], game.get("away_hits"), game.get("away_errors"), away_won)
-        draw_team_row(home_y, home_ls, game["home_score"], game.get("home_hits"), game.get("home_errors"), home_won)
+        draw_team_row(away_y0, away_y1, away_ls, game["away_score"], game.get("away_hits"), game.get("away_errors"), away_won)
+        draw_team_row(home_y0, home_y1, home_ls, game["home_score"], game.get("home_hits"), game.get("home_errors"), home_won)
 
     def _render_upcoming_game(self, image, draw, game, width, height):
         """Scheduled game that hasn't started: team columns show only
