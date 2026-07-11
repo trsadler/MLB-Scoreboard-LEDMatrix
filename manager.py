@@ -2118,18 +2118,16 @@ class TidbytBaseballPlugin(BasePlugin):
 
         col_widths = [inning_col_w] * num_innings + [wide_col_w, wide_col_w, e_col_w]
         total_grid_w = sum(col_widths)
-        # IMPORTANT: the grid's exact fixed width (per the 1px-padding
-        # spec) is usually narrower than the full available right_w --
-        # confirmed this was being left-aligned with ALL the leftover
-        # space dumped after the E column, and with no border marking
-        # where the table actually ends, that undivided trailing green
-        # space visually read as if it were part of the E column itself
-        # ("too much padding to the right of E"). Centering the grid
-        # instead splits any leftover space evenly as margin on both
-        # sides, and a right-edge border (added below, alongside the
-        # existing internal dividers) makes the table's true boundary
-        # visually unambiguous regardless of how much margin remains.
-        grid_x0 = right_x0 + max((right_w - total_grid_w) // 2, 0)
+        # REVERTED centering: confirmed via direct debug logging that the
+        # column-width/padding math itself is correct (col_bounds matches
+        # exactly between sandbox and real deployment), but centering the
+        # grid introduced a NEW visible gap between the separator and the
+        # start of the grid that wasn't there before, which made the
+        # overall layout look worse. Back to flush-left against the
+        # separator -- the right-edge border (drawn below, alongside
+        # internal dividers) still fixes the original "E column looks
+        # too wide" issue on its own, without needing centering too.
+        grid_x0 = right_x0
         col_bounds = [grid_x0]
         for cw in col_widths:
             col_bounds.append(col_bounds[-1] + cw)

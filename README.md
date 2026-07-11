@@ -216,6 +216,33 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Confirmed via direct debug logging: padding math is correct; reverted a regression
+
+Added a debug log line directly inside `_render_final_game` reporting
+the exact internal `col_bounds`/`grid_x0` the running code actually
+computes -- no external reconstruction, straight from the source. Ran
+it against the real deployed system: the reported values were
+**character-for-character identical** to this sandbox's own
+computation. That's conclusive -- the column-width and padding math is
+provably correct on the actual deployed code, not a version mismatch,
+not a stale file.
+
+**The centering change from the previous round was the actual
+regression.** It fixed the original "E column looks too wide" issue,
+but introduced a new visible gap between the separator and the start
+of the grid that wasn't there before, which made the overall layout
+look worse. Reverted to flush-left alignment (`grid_x0 = right_x0`,
+no centering offset) while keeping the right-edge border, which is
+what actually fixed the E-column issue and doesn't depend on
+centering to work. Verified directly: left edge is now flush against
+the separator with no gap, the right-edge border still exists marking
+the table's true end, and padding still measures exactly 1px on every
+column.
+
+Left the debug log line in place for now in case further diagnosis is
+needed -- worth removing once everything is confirmed resolved, since
+it fires on every final-game render.
+
 ## Fixed: unbordered leftover space made E column look oversized
 
 **Confirmed real, separate from the padding question**: the fixed-
