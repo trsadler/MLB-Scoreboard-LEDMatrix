@@ -216,6 +216,92 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: double-digit numbers overflowing box score cells
+
+**Confirmed by direct measurement**: "10" needs 8px of ink width, but
+every column (innings AND R/H/E) shared equal width -- only 6-7px
+total including borders. Any double-digit value was guaranteed to
+overflow into the neighboring cell, which is exactly what showed up in
+the photo (a double-digit run total).
+
+**Fixed by reallocating column width, not just shrinking text**: R/H/E
+(game totals) realistically reach double digits far more often than
+any single inning does -- a team scoring 10+ runs in ONE inning is
+exceptionally rare in real MLB -- so R/H/E columns now get roughly
+1.8x the width of an inning column, at the expense of inning columns
+being slightly narrower (still comfortably enough for the single digit
+they'll almost always need). Same weighted-cumulative-boundary
+approach as the earlier border fix, just with per-column weights
+instead of uniform ones.
+
+Verified with actual pixel containment checks, not just visual
+inspection: rendered a game with a double-digit run total (matching
+the photo), double-digit hits for both teams, and confirmed each of
+R/H/E stays fully within its own column boundary with no bleed into
+the next. Also stress-tested the worst realistic combination --
+extra innings AND double-digit hits/errors on both teams
+simultaneously -- and confirmed it still renders without crashing or
+overflowing.
+
+## New: dedicated (longer) duration for the home run animation
+
+The 3-phase animation needs more time than a plain text flash to
+actually play out -- at the default `last_play_display_seconds` (5s),
+the fireworks/scrolling-text phase barely gets 2-3 seconds. Added
+`home_run_display_seconds` (default 10) as a separate setting: when
+the flash queue promotes a play, it now checks whether that specific
+play is a home run (via the same `_is_home_run_play` detection used
+for the animation itself) and uses the dedicated longer duration if
+so, while every other significant play still uses the normal
+`last_play_display_seconds` -- regardless of what either is
+configured to, one never affects the other.
+
+Verified end-to-end: a queued home run correctly gets the full
+`home_run_display_seconds` duration, a queued regular play (e.g. a
+double) still gets the normal shorter duration in the same test run.
+At the new default (10s), phase math works out to ~7.3s for the
+settled fireworks+text phase, comfortably enough to read a full
+scrolling play description.
+
+## Pitch count: rebuilt on confirmed real data (no longer a guess)
+
+Real diagnostic data (2026-07-11, across 7 live games) confirmed the
+entire previous approach was searching the wrong place: zero matches
+anywhere in `boxscore` for a pitch-count field across every game
+tested. The real signal is in the `plays` array -- each individual
+pitch is its own entry with `type.type == "play-result"`, and the
+pitcher who threw it is identified via
+`participants: [{"athlete": {"id": ...}, "type": "pitcher"}, ...]`.
+There's no simple pre-computed "total pitches" field; the real
+cumulative count comes from counting these entries across the whole
+game (`_count_pitches_for_pitcher`).
+
+**A real double-counting trap the data revealed**: the entry
+immediately after each at-bat's final pitch ("End Batter/Pitcher",
+`type.type == "end-batterpitcher"`) repeats that same pitch's
+`atBatPitchNumber` -- confirmed via the real dump that this is a
+duplicate bookkeeping marker, not a new pitch. Filtering strictly to
+`"play-result"` avoids counting it twice.
+
+Also handles a real edge case the diagnostic surfaced:
+`situation.pitcher` came back empty during a brief state transition
+between innings. Added a fallback that derives the current pitcher
+from the most recent `play-result` entry's `participants` instead,
+which is far more consistently populated.
+
+Tested against the exact real structure from the diagnostic dump:
+correctly counts 3 (not 4) pitches for an at-bat ending in a strikeout
+without double-counting the duplicate marker; correctly isolates a
+different pitcher's count to zero/none; correctly sums across multiple
+at-bats and a mid-game pitching change (12 for a starter across three
+at-bats, 2 for the reliever who took over); and correctly falls back
+to deriving the pitcher's identity from play-by-play when the
+situation snapshot is empty.
+
+The old boxscore-search logic is kept as a secondary fallback in case
+some other context does expose a direct field, but it's no longer the
+primary strategy since it's confirmed absent in the common case.
+
 ## Three fixes: home run detection, box score left gap, pitch count accuracy
 
 **1. Home run animation never triggering** -- root cause confirmed:

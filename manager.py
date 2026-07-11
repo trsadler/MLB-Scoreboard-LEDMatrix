@@ -418,6 +418,7 @@ class TidbytBaseballPlugin(BasePlugin):
         self.show_batter_name = cfg.get("show_batter_name", True)
         self.show_last_play = cfg.get("show_last_play", True)
         self.last_play_display_seconds = cfg.get("last_play_display_seconds", 5)
+        self.home_run_display_seconds = cfg.get("home_run_display_seconds", 10)
         self.last_play_filter = cfg.get("last_play_filter", "significant")
         self.show_past_games = cfg.get("show_past_games", False)
         self.show_upcoming_games = cfg.get("show_upcoming_games", False)
@@ -987,21 +988,36 @@ class TidbytBaseballPlugin(BasePlugin):
 
             if self._active_flash is None and self._pending_flash_event_ids:
                 next_event_id = self._pending_flash_event_ids.pop(0)
-                self._active_flash = {
-                    "event_id": next_event_id,
-                    "started_at": now,
-                    "duration": self.last_play_display_seconds,
-                    "expires_at": now + self.last_play_display_seconds,
-                }
+
+                # Look up the game BEFORE constructing the active-flash
+                # dict, so home runs can get their own (longer) duration
+                # instead of the general last-play duration -- the
+                # animation needs more time to play out fully than a
+                # plain text flash does.
                 matched = False
+                matched_game = None
                 for idx, g in enumerate(self.rotation_games):
                     if g.get("event_id") == next_event_id:
                         self.current_index = idx
                         matched = True
+                        matched_game = g
                         break
+
+                duration = self.last_play_display_seconds
+                if matched_game and self._is_home_run_play(
+                    matched_game.get("last_play_type") or "", matched_game.get("last_play_text") or ""
+                ):
+                    duration = self.home_run_display_seconds
+
+                self._active_flash = {
+                    "event_id": next_event_id,
+                    "started_at": now,
+                    "duration": duration,
+                    "expires_at": now + duration,
+                }
                 self.logger.info(
                     f"Last-play flash NOW SHOWING (event_id={next_event_id}, "
-                    f"matched to a currently-live game: {matched})"
+                    f"matched to a currently-live game: {matched}, duration={duration}s)"
                 )
 
             return dict(self._active_flash) if self._active_flash else None
@@ -1068,19 +1084,26 @@ class TidbytBaseballPlugin(BasePlugin):
         self._enriched_boxscore_event_ids.add(event_id)
 
     def _enrich_pitch_count(self, game: Dict[str, Any]):
-        """Fetches ESPN's detailed per-game summary endpoint and tries
-        to find the current pitcher's live pitch count in it. The
-        lightweight scoreboard endpoint doesn't have this (confirmed
-        from real captured data), so this is a second API call per live
-        game per poll cycle.
+        """Fetches ESPN's detailed per-game summary endpoint for the
+        current pitcher's live pitch count. The lightweight scoreboard
+        endpoint doesn't have this (confirmed from real captured data).
 
-        ESPN's summary endpoint isn't officially documented either, so
-        this tries a few plausible paths first, then falls back to a
-        generic recursive scan for any key that looks like a pitch
-        count. If NONE of this finds it, logs the raw structure at
-        DEBUG level (only fires once you actually enable debug logging)
-        so we have real data to fix this precisely rather than guessing
-        again -- same approach that worked for the batter name."""
+        CONFIRMED against real live-game data (2026-07-11, NYY@WSH):
+        there is no simple pre-computed "total pitch count" field
+        anywhere in this response -- the previous approach searching
+        boxscore.players[].statistics[] was looking in the wrong place
+        entirely (confirmed zero matches across 7 different live games).
+        The real signal is the `plays` array: each individual pitch is
+        its own entry with `type.type == "play-result"` and a
+        `participants` list identifying who was pitching/batting via
+        `{"athlete": {"id": ...}, "type": "pitcher"}`. Cumulative pitch
+        count = counting how many such entries belong to the current
+        pitcher across the whole game (see _count_pitches_for_pitcher).
+
+        Falls back to the old boxscore-search approach afterward in
+        case some other context does expose a direct field, but that's
+        no longer the primary strategy since it's confirmed to not
+        exist in the common case."""
         event_id = game.get("event_id")
         if not event_id:
             return
@@ -1091,8 +1114,6 @@ class TidbytBaseballPlugin(BasePlugin):
 
         pitcher_id = None
         try:
-            # Re-derive the pitcher's ID the same way the scoreboard did,
-            # so we can match them up in the summary's boxscore section.
             for comp in data.get("header", {}).get("competitions", []):
                 situation = comp.get("situation", {})
                 pid = situation.get("pitcher", {}).get("playerId") or situation.get("pitcher", {}).get("athlete", {}).get("id")
@@ -1102,21 +1123,71 @@ class TidbytBaseballPlugin(BasePlugin):
         except Exception:
             pass
 
-        count = self._find_pitch_count(data, pitcher_id)
+        # situation.pitcher can be empty during brief state transitions
+        # (confirmed: happened in real diagnostic output caught between
+        # innings) -- fall back to whoever the most recent play-result
+        # in `plays` lists as the pitcher, which is far more consistently
+        # populated than the situation snapshot.
+        plays = data.get("plays", [])
+        if not pitcher_id:
+            for p in reversed(plays):
+                if p.get("type", {}).get("type") != "play-result":
+                    continue
+                for part in p.get("participants", []):
+                    if part.get("type") == "pitcher":
+                        pid = part.get("athlete", {}).get("id")
+                        if pid:
+                            pitcher_id = str(pid)
+                        break
+                if pitcher_id:
+                    break
+
+        count = self._count_pitches_for_pitcher(plays, pitcher_id) if pitcher_id else None
+
+        if count is None:
+            # Fall back to the old search approach, kept only in case some
+            # other context does expose a direct field -- not the primary
+            # strategy anymore since it's confirmed absent in the common case.
+            count = self._find_pitch_count(data, pitcher_id)
+
         if count is not None:
             game["pitch_count"] = count
             self.logger.info(
                 f"Pitch count for {game['away_abbr']}@{game['home_abbr']} "
-                f"(pitcher_id={pitcher_id}): found {count}. If this doesn't match "
-                f"what you see on a real broadcast/MLB app, please report it -- "
-                f"the matching logic that finds this is a best-effort guess, not confirmed."
+                f"(pitcher_id={pitcher_id}): counted {count} from play-by-play. "
+                f"If this doesn't match a real broadcast/MLB app, please report it."
             )
         else:
             self.logger.debug(
-                f"Could not find a pitch count in the summary response for "
+                f"Could not determine a pitch count for "
                 f"{game['away_abbr']}@{game['home_abbr']} (pitcher_id={pitcher_id}). "
-                f"Top-level summary keys: {list(data.keys())}"
+                f"Plays in response: {len(plays)}."
             )
+
+    def _count_pitches_for_pitcher(self, plays: List[Dict[str, Any]], pitcher_id: str) -> Optional[int]:
+        """Counts real pitches thrown by `pitcher_id` across the whole
+        game, confirmed against real ESPN play-by-play structure
+        (2026-07-11): each individual pitch is a distinct entry with
+        `type.type == "play-result"`; the pitcher who threw it is
+        identified via `participants: [{"athlete": {"id": ...}, "type":
+        "pitcher"}, ...]`.
+
+        IMPORTANT: the entry immediately after each at-bat's final pitch
+        ("End Batter/Pitcher", type.type == "end-batterpitcher") repeats
+        that same pitch's atBatPitchNumber -- confirmed via real data
+        that this is a duplicate bookkeeping marker, not a new pitch.
+        Filtering strictly to "play-result" avoids double-counting it."""
+        if not plays:
+            return None
+        count = 0
+        for p in plays:
+            if p.get("type", {}).get("type") != "play-result":
+                continue
+            for part in p.get("participants", []):
+                if part.get("type") == "pitcher" and str(part.get("athlete", {}).get("id")) == pitcher_id:
+                    count += 1
+                    break
+        return count if count > 0 else None
 
     def _find_pitch_count(self, data: Any, pitcher_id: Optional[str]) -> Optional[int]:
         """Tries a couple of specific plausible paths first (boxscore
@@ -1959,9 +2030,26 @@ class TidbytBaseballPlugin(BasePlugin):
         # border strip rather than part of the table. Cumulative
         # boundaries instead guarantee the grid spans the FULL right_w
         # exactly, distributing any rounding slack across columns
-        # instead of dumping it all in one unused strip -- and as a
-        # side effect, cells end up very slightly larger on average.
-        col_bounds = [right_x0 + round(i * right_w / total_cols) for i in range(total_cols + 1)]
+        # instead of dumping it all in one unused strip.
+        #
+        # ALSO IMPORTANT: equal-width columns broke for any double-digit
+        # value -- confirmed by direct measurement that "10" needs 8px
+        # of ink, but an equal-width column here is only 6-7px total
+        # (borders included), so it always overflowed into the next
+        # cell. R/H/E (game totals) realistically reach double digits
+        # far more often than any single inning does (a team scoring
+        # 10+ runs in ONE inning is exceptionally rare in real MLB), so
+        # R/H/E columns get extra weight at the expense of slightly
+        # narrower inning columns, which only need to comfortably fit a
+        # single digit in the overwhelming majority of real games.
+        weight_inning = 1.0
+        weight_rhe = 1.8
+        weights = [weight_inning] * num_innings + [weight_rhe] * extra_cols
+        total_weight = sum(weights)
+        cum_weight = [0.0]
+        for w in weights:
+            cum_weight.append(cum_weight[-1] + w)
+        col_bounds = [right_x0 + round(cw / total_weight * right_w) for cw in cum_weight]
         row_bounds = [round(i * height / 3) for i in range(4)]
 
         header_y0, header_y1 = row_bounds[0], row_bounds[1]

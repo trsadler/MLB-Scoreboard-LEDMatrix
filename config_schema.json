@@ -213,6 +213,12 @@
       "default": 1800,
       "minimum": 60,
       "description": "How often to re-run the past-days lookback (separate from the main scoreboard poll interval, since completed games don't change)."
+    },
+    "home_run_display_seconds": {
+      "type": "number",
+      "default": 10,
+      "minimum": 1,
+      "description": "How long the home run animation plays, independent of last_play_display_seconds -- the 3-phase animation (ball arc, strobe, fireworks+scrolling text) needs more time than a plain text flash to play out fully."
     }
   },
   "required": [

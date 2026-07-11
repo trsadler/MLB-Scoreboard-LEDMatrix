@@ -19,6 +19,7 @@
     "show_batter_name": true,
     "show_last_play": true,
     "last_play_display_seconds": 5,
+    "home_run_display_seconds": 10,
     "last_play_filter": "significant",
     "show_past_games": false,
     "show_upcoming_games": false,
