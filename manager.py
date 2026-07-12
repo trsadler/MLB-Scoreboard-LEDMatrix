@@ -1704,6 +1704,24 @@ class TidbytBaseballPlugin(BasePlugin):
             "away_errors": away_errors,
             "home_errors": home_errors,
             "state": status_type.get("state", "pre"),
+            # Best-effort delay detection -- NOT confirmed against a real
+            # captured delay from ESPN (haven't seen one in any of the
+            # real data collected so far this project). ESPN's status
+            # object for other sports has been observed (via public docs)
+            # to include a human-readable "detail" string alongside
+            # "state" -- state typically stays "in" during a delay since
+            # the game hasn't ended, but the detail/description/name text
+            # should say something like "Delayed" or "Rain Delay".
+            # Checking for "delay" as a substring is deliberately loose
+            # so it's robust to whichever exact field/wording ESPN uses,
+            # rather than betting on one exact string match. If this
+            # doesn't trigger during a real delay, check the plugin logs
+            # for "Live game status text:" during that delay and report
+            # back the actual text so this can be tightened/confirmed.
+            "is_delayed": any(
+                "delay" in str(status_type.get(k, "")).lower()
+                for k in ("description", "detail", "shortDetail", "name")
+            ),
             "away_abbr": away.get("team", {}).get("abbreviation", "AWY")[:3].upper(),
             "home_abbr": home.get("team", {}).get("abbreviation", "HOM")[:3].upper(),
             "away_score": int(away.get("score", 0) or 0),
@@ -1933,6 +1951,18 @@ class TidbytBaseballPlugin(BasePlugin):
                         image, draw, right_x0, 0, right_w, height,
                         game.get("last_play_text") or "", fill=(255, 255, 255),
                     )
+            elif game.get("is_delayed"):
+                # Replace the whole right half with "DELAYED" in red
+                # until the game resumes -- there's no live situation
+                # worth showing (pitch count, batter, diamond, etc. are
+                # all stale/frozen) while a delay is in progress.
+                delay_font = self._load_font(10, bold=True)
+                text = "DELAYED"
+                bbox = self._measure(delay_font, text)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                tx = right_x0 + max((right_w - tw) // 2, 0)
+                ty = max((height - th) // 2, 0) - bbox[1]
+                self._render_text(image, (tx, ty), text, delay_font, (255, 40, 40))
             else:
                 top_margin = 1
                 lower_y = height - 6  # bottom-row (count/batter) text measures ~5px tall

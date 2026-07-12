@@ -216,6 +216,31 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## New: "DELAYED" overlay for rain delays / game stoppages
+
+When a live game is detected as delayed, the whole right half now
+shows "DELAYED" in red instead of the normal pitch count/batter/
+diamond info, which would otherwise just sit frozen/stale during a
+stoppage.
+
+**Data confidence, same honest breakdown as other ESPN-dependent
+features in this plugin**: I don't have a real captured example of
+what ESPN's status object looks like during an actual delay -- haven't
+seen one in any of the real data collected throughout this project so
+far. Implemented defensively: checks several plausible status fields
+(`description`, `detail`, `shortDetail`, `name`) for the substring
+"delay" (case-insensitive), rather than betting on one exact string,
+so it's robust to whichever field ESPN actually uses. Tested against
+6 plausible representations (various delay-indicating strings across
+different field names, plus normal in-progress and empty-status
+negative cases) -- all correctly detected or correctly not flagged.
+
+If this doesn't trigger during a real rain delay, the fix is
+straightforward: whatever the real status text turns out to be almost
+certainly still contains "delay" somewhere, but if it doesn't, report
+back the actual status text and the keyword/field list can be
+adjusted directly.
+
 ## New: past_upcoming_all_teams only applies when NOTHING is live anywhere
 
 Clarified a real gap: previously, whenever `past_upcoming_all_teams`
