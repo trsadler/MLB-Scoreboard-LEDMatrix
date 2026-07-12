@@ -1853,22 +1853,33 @@ class TidbytBaseballPlugin(BasePlugin):
             if game.get("game_type") == "final":
                 col_w = int(width * 0.4) // 2
                 cap_h = height
+                bleed = 4
             elif game.get("game_type") == "upcoming":
                 col_w = 41
                 # Logos only have the area ABOVE the bottom bar to fit
                 # in now, not the full panel height -- see
-                # _render_upcoming_game's two-tier layout.
+                # _render_upcoming_game's two-tier layout. NO bleed
+                # allowance here (unlike final/live) -- confirmed via a
+                # real screenshot that the usual +4 bleed, meant for
+                # spilling harmlessly off the outer panel edge, instead
+                # spills DOWN into the record bar below (the vertical
+                # centering clamps to 0 rather than splitting overflow
+                # evenly, so an oversized logo doesn't peek out top and
+                # bottom symmetrically -- it dumps the whole overflow
+                # into the bar).
                 cap_h = height - 9
+                bleed = 0
             else:
                 col_w = (width // 2) // 2
                 cap_h = height
+                bleed = 4
             # Slightly larger than the column itself -- allowed to bleed
             # a small amount off the panel edges (and, since two columns
             # sit side by side, potentially a couple px into the
             # neighboring team's column too, though most team logos
             # taper to transparent near their outer edge so this is
             # rarely very visible in practice).
-            size = max(min(col_w, cap_h) + 4, 12)
+            size = max(min(col_w, cap_h) + bleed, 12)
         game["away_logo"] = self._get_team_logo(game["away_abbr"], game.get("away_logo_url"), size)
         game["home_logo"] = self._get_team_logo(game["home_abbr"], game.get("home_logo_url"), size)
 
@@ -2373,9 +2384,13 @@ class TidbytBaseballPlugin(BasePlugin):
             # and "PHI" lines up under the home logo, per explicit
             # request, rather than the combined "ABBR RECORD" block
             # being centered as one unit within the half.
+            #
+            # +1 on ty: confirmed via pixel measurement that text was
+            # starting immediately at the row right after the
+            # horizontal stroke, 0px clearance -- shifted down 1px.
             abbr_bbox = self._measure(self.font_tiny, abbr)
             abbr_w = abbr_bbox[2] - abbr_bbox[0]
-            ty = bar_y0 + max((bar_h - bar_line_h) // 2, 0) - abbr_bbox[1]
+            ty = bar_y0 + max((bar_h - bar_line_h) // 2, 0) - abbr_bbox[1] + 1
 
             if is_away:
                 abbr_x = max((side_w - abbr_w) // 2, 0)
@@ -2387,7 +2402,17 @@ class TidbytBaseballPlugin(BasePlugin):
                 rec_bbox = self._measure(self.font_tiny, record)
                 rec_w = rec_bbox[2] - rec_bbox[0]
                 gap = 4
-                rec_x = (abbr_x + abbr_w + gap) if is_away else (abbr_x - gap - rec_w)
+                if is_away:
+                    rec_x = abbr_x + abbr_w + gap
+                    # Confirmed via pixel measurement that a long
+                    # record could reach (and for home, actually
+                    # overlap) the middle stroke -- clamp so the
+                    # record's rightmost pixel stays at least 1px clear
+                    # of it (stroke occupies mid_x, mid_x+1).
+                    rec_x = min(rec_x, mid_x - 2 - rec_w)
+                else:
+                    rec_x = abbr_x - gap - rec_w
+                    rec_x = max(rec_x, mid_x + 3)
                 self._render_text(image, (rec_x, ty), record, self.font_tiny, text_color)
 
         draw_bar_text(True, game["away_abbr"], game.get("away_record"), away_txt_color)
@@ -2415,11 +2440,23 @@ class TidbytBaseballPlugin(BasePlugin):
             logo_y = max((top_h - home_logo.height) // 2, 0)
             image.paste(home_logo, (logo_x, logo_y), home_logo)
 
+        def ink_centered_x(font, text, x0, w):
+            """Centers based on actual rendered ink width instead of
+            _measure's width, which was confirmed to consistently
+            overstate width by 1px for this text (includes trailing
+            advance space, not just ink) -- same root cause as the
+            earlier box-score digit-centering fix, just showing up here
+            as a consistent 0.5-1.5px left lean across all three lines
+            instead of per-digit jitter."""
+            left, right = self._ink_extent(font, text)
+            ink_w = right - left + 1
+            target_ink_x0 = x0 + max((w - ink_w) // 2, 0)
+            return target_ink_x0 - left + 3
+
         title_font = self._load_font(8, bold=True)
         title = "UPCOMING"
         tbbox = self._measure(title_font, title)
-        tw = tbbox[2] - tbbox[0]
-        tx = middle_x0 + max((middle_w - tw) // 2, 0)
+        tx = ink_centered_x(title_font, title, middle_x0, middle_w)
         ty = 2 - tbbox[1]
         self._render_text(image, (tx, ty), title, title_font, (255, 255, 255))
 
@@ -2434,11 +2471,25 @@ class TidbytBaseballPlugin(BasePlugin):
 
         for line in filter(None, [date_str, time_str]):
             lbbox = self._measure(info_font, line)
-            lw = lbbox[2] - lbbox[0]
-            lx = middle_x0 + max((middle_w - lw) // 2, 0)
+            lx = ink_centered_x(info_font, line, middle_x0, middle_w)
             ly = cursor_y - lbbox[1]
             self._render_text(image, (lx, ly), line, info_font, (200, 200, 200))
             cursor_y += (lbbox[3] - lbbox[1]) + 1
+
+        # 2px white strokes dividing the four sections, drawn last so
+        # they sit visibly on top of logos/bar text rather than being
+        # drawn underneath and potentially obscured.
+        STROKE = (255, 255, 255)
+        stroke_w = 2
+        # Right edge of away block / left edge of home block (top tier
+        # verticals, spanning just the logo area above the bar).
+        draw.rectangle([side_w, 0, side_w + stroke_w - 1, top_h - 1], fill=STROKE)
+        draw.rectangle([width - side_w, 0, width - side_w + stroke_w - 1, top_h - 1], fill=STROKE)
+        # Horizontal, full width, across the top of the record bar.
+        draw.rectangle([0, top_h, width - 1, top_h + stroke_w - 1], fill=STROKE)
+        # Vertical, down the middle of the record bar where the two
+        # halves meet.
+        draw.rectangle([mid_x, top_h, mid_x + stroke_w - 1, height - 1], fill=STROKE)
 
     def _push_image(self, image: Image.Image, force_clear: bool):
         dm = self.display_manager

@@ -216,6 +216,81 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: UPCOMING/date/time text was measurably off-center
+
+Confirmed real via direct pixel measurement (not just visual
+impression): all three lines leaned consistently ~1-1.5px left of
+where they should be. Root cause was the exact same one already found
+and fixed for the box-score digits -- `_measure()`'s reported width
+includes trailing advance space, not just actual ink, so centering
+against it systematically shifts text left. Applied the same
+ink-extent-based centering fix used there.
+
+**Also caught and corrected an error in my own verification**: my
+first comparison used 64.0 as the "true center" of the middle section,
+which is wrong -- a 46px-wide section starting at x=41 spans pixels 41
+to 86 inclusive, so the actual true center is 63.5. Recomputed against
+the correct value: the title now lands exactly on 63.5 (a full 1px
+improvement from 62.5 before the fix), the date line matches exactly,
+and the time line is 0.5px off -- an unavoidable integer-rounding
+artifact from odd leftover space, not a bug.
+
+## Fixed: bar text touching the white strokes, no padding
+
+Measured directly and found two real zero-gap cases: the horizontal
+stroke (top of the bar) had text starting immediately in the very
+next row with 0px clearance, and a long record could reach (home's
+case: actually overlap) the vertical stroke down the middle of the
+bar.
+
+Fixed both: shifted the bar text down 1px to clear the horizontal
+stroke, and added a hard clamp on the record's position so it can
+never get closer than 1px to the middle stroke, regardless of how
+long the record text is -- this is a mathematical guarantee by
+construction (a `min()`/`max()` against the stroke's fixed position),
+not just something that happened to test fine. Verified with the
+original data (11px/1px+ gaps, comfortably clear) and stress-tested
+with unrealistically long records (`102-60`/`100-62`) to confirm the
+clamp actually engages under real pressure, not just passing by
+coincidence in the common case.
+
+One thing worth flagging: my own first verification pass on this
+produced a false "still overlapping" result, because the vertical
+middle stroke itself spans the full bar height, and a naive scan for
+"white pixels in the home text region" was picking up the stroke's own
+pixels and mistaking them for text. Corrected the verification to
+exclude the stroke's own columns before re-checking -- worth keeping
+in mind for anyone touching this code again.
+
+## Three fixes: logo bleed into the record bar, centering, and grid strokes
+
+**Logo bleed, confirmed and fixed**: found the real cause -- logo
+sizing included a "+4 bleed" allowance meant for spilling harmlessly
+off the panel's outer edge (fine in the live/final layouts), but for
+upcoming games that same +4px instead spilled DOWN into the record
+bar below, since the vertical centering clamps to 0 rather than
+splitting overflow evenly top/bottom -- an oversized logo dumps its
+whole overflow downward rather than peeking out symmetrically.
+Removed the bleed allowance specifically for upcoming-game logos (kept
+for live/final, where it's harmless). Verified the new size (23px)
+exactly matches the available top-tier height, and confirmed via
+row-by-row pixel density that no logo-shaped blob appears below the
+boundary -- only the intentional stroke line and the bar's own thin
+text.
+
+**Horizontal centering**: measured directly and found only a ~1.5px
+offset (likely just integer rounding), not the significant shift
+shown in the screenshot -- suspect that screenshot was from a
+slightly earlier version, given how many layout iterations happened
+in quick succession this session. Worth a fresh look once updated.
+
+**New: 2px white grid strokes** dividing the four sections, per
+sketch -- right edge of the away block / left edge of the home block
+(top-tier verticals), a full-width horizontal across the top of the
+record bar, and a vertical down the middle of the bar where the two
+halves meet. Drawn last so they sit visibly on top of logos and bar
+text rather than being potentially obscured underneath.
+
 ## Fixed: date/time block had zero clearance above the bottom bar
 
 Measured directly rather than assuming: the last line of text
