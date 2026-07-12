@@ -18,16 +18,16 @@
       ],
       "description": "ESPN team abbreviations, used as the fallback game (scheduled/recent) when nothing is live, and as the rotation filter if show_favorite_teams_only is true"
     },
-    "show_favorite_teams_only": {
-      "type": "boolean",
-      "default": false,
-      "description": "STRICT mode: never show any other team's games at all (live, past, or upcoming) -- always favorites only. When off (default), favorites still take priority whenever they have a live game, but other teams' live games and past/upcoming games can fill the rotation when no favorite is currently playing."
-    },
     "game_rotation_seconds": {
       "type": "integer",
       "default": 8,
       "minimum": 3,
-      "description": "How many seconds to show each live game before switching to the next one"
+      "description": "How many seconds to show each game in rotation before switching to the next one -- applies to live, past, and upcoming games alike, not just live ones. NOT the same as display_duration below (that's how long this whole plugin shows before the broader LEDMatrix system switches to a different plugin entirely)."
+    },
+    "display_duration": {
+      "type": "number",
+      "default": 20,
+      "description": "Seconds to show this ENTIRE plugin before the LEDMatrix system's own rotation switches to a different plugin. Distinct from game_rotation_seconds above, which cycles between games WITHIN this plugin while it's showing."
     },
     "update_interval_seconds": {
       "type": "integer",
@@ -41,10 +41,76 @@
       "minimum": 5,
       "description": "How often to poll ESPN while games are live"
     },
-    "display_duration": {
-      "type": "number",
-      "default": 20,
-      "description": "Seconds to show this plugin per rotation in the main LEDMatrix display cycle"
+    "show_favorite_teams_only": {
+      "type": "boolean",
+      "default": false,
+      "description": "STRICT mode: never show any other team's games at all (live, past, or upcoming) -- always favorites only. When off (default), favorites still take priority whenever they have a live game, but other teams' live games and past/upcoming games can fill the rotation when no favorite is currently playing."
+    },
+    "past_upcoming_all_teams": {
+      "type": "boolean",
+      "default": false,
+      "description": "Only relevant when NOTHING is currently live anywhere (not just when no favorite is live) -- as soon as any game goes live, favorite or not, past/upcoming games are always restricted to favorites only regardless of this setting. When nothing is live: controls whether past/upcoming games expand to include all teams (true) or stay scoped to favorite teams only (false, default). Ignored (always favorites-only) when show_favorite_teams_only is on."
+    },
+    "show_past_games": {
+      "type": "boolean",
+      "default": false,
+      "description": "Include recently completed favorite-team games in the rotation, showing the final score with the winning team highlighted in yellow and \"FINAL\" on the black half."
+    },
+    "max_past_games": {
+      "type": "integer",
+      "default": 3,
+      "minimum": 1,
+      "description": "Maximum number of past (final) favorite-team games to include in rotation"
+    },
+    "past_games_lookback_days": {
+      "type": "integer",
+      "default": 3,
+      "minimum": 1,
+      "description": "How many days back to explicitly check for a favorite team's completed games. ESPN's scoreboard endpoint only returns TODAY's games by default, so this queries additional past days individually (one extra request per day) to actually find a team's most recent finished game if it wasn't today."
+    },
+    "past_games_refresh_seconds": {
+      "type": "integer",
+      "default": 1800,
+      "minimum": 60,
+      "description": "How often to re-run the past-days lookback (separate from the main scoreboard poll interval, since completed games don't change)."
+    },
+    "show_upcoming_games": {
+      "type": "boolean",
+      "default": false,
+      "description": "Include upcoming scheduled favorite-team games in the rotation (in start-time order), showing \"UPCOMING\" plus the date/time on the black half. No score is shown since the game hasn't started."
+    },
+    "max_upcoming_games": {
+      "type": "integer",
+      "default": 3,
+      "minimum": 1,
+      "description": "Maximum number of upcoming favorite-team games to include in rotation"
+    },
+    "upcoming_games_lookahead_days": {
+      "type": "integer",
+      "default": 5,
+      "minimum": 1,
+      "description": "How many days ahead to explicitly check for upcoming favorite-team games. ESPN's scoreboard endpoint only returns TODAY's games by default, so this queries additional future days individually (one extra request per day) to actually find a team's next scheduled game."
+    },
+    "upcoming_games_refresh_seconds": {
+      "type": "integer",
+      "default": 1800,
+      "minimum": 60,
+      "description": "How often to re-run the future-days lookahead (separate from the main scoreboard poll interval, since schedules barely change within a day -- no need to re-check every 15 seconds during a live game)."
+    },
+    "show_logos": {
+      "type": "boolean",
+      "default": true,
+      "description": "Show each team's logo at the top of its column"
+    },
+    "logo_dir": {
+      "type": "string",
+      "default": "assets/sports/mlb_logos",
+      "description": "Path (relative to the LEDMatrix install root) to bundled team logo PNGs, named e.g. PHI.png. Falls back to downloading from ESPN if a team's file isn't found here."
+    },
+    "use_team_colors": {
+      "type": "boolean",
+      "default": true,
+      "description": "Pull each team's real primary color from ESPN instead of using the away_color/home_color fallbacks below. When this is on (the default), away_color/home_color are ONLY used if ESPN's color data is unavailable for some reason -- they won't override real team colors just because you've set them."
     },
     "away_color": {
       "type": "array",
@@ -56,7 +122,7 @@
         255,
         255
       ],
-      "description": "RGB fallback color for the away team column"
+      "description": "RGB fallback color for the away team column -- only actually used when use_team_colors is off, or when ESPN doesn't provide a color for that team."
     },
     "home_color": {
       "type": "array",
@@ -68,22 +134,7 @@
         255,
         255
       ],
-      "description": "RGB fallback color for the home team column"
-    },
-    "use_team_colors": {
-      "type": "boolean",
-      "default": true,
-      "description": "Pull each team's real primary color from ESPN instead of using the fallback colors above"
-    },
-    "show_logos": {
-      "type": "boolean",
-      "default": true,
-      "description": "Show each team's logo at the top of its column"
-    },
-    "logo_dir": {
-      "type": "string",
-      "default": "assets/sports/mlb_logos",
-      "description": "Path (relative to the LEDMatrix install root) to bundled team logo PNGs, named e.g. PHI.png. Falls back to downloading from ESPN if a team's file isn't found here."
+      "description": "RGB fallback color for the home team column -- only actually used when use_team_colors is off, or when ESPN doesn't provide a color for that team."
     },
     "base_fill_color": {
       "type": "array",
@@ -133,15 +184,25 @@
       ],
       "description": "RGB color for a not-yet-recorded out square outline"
     },
-    "test_mode": {
-      "type": "boolean",
-      "default": false,
-      "description": "Render a fake in-progress game instead of calling ESPN (for layout testing)"
-    },
     "show_batter_name": {
       "type": "boolean",
       "default": true,
       "description": "Show the current batter (first initial + last name) at the bottom-right of the black half, next to the ball-strike count. Depends on ESPN actually providing batter data in the scoreboard response -- silently omitted if not available."
+    },
+    "show_pitcher_name": {
+      "type": "boolean",
+      "default": true,
+      "description": "Show the current pitcher's name at the top of the black half. Independent of show_pitch_count below -- can show one without the other."
+    },
+    "show_pitch_count": {
+      "type": "boolean",
+      "default": true,
+      "description": "Show the current pitcher's pitch count (\"P:47\"). Independent of show_pitcher_name above -- if both are on, shows \"P:47 T.Skubal\" combined; if only this is on, shows just \"P:47\"."
+    },
+    "show_delayed_overlay": {
+      "type": "boolean",
+      "default": true,
+      "description": "Replace the black half with \"DELAYED\" in red when a live game is in a rain delay or other stoppage, instead of showing the (stale/frozen) normal live info."
     },
     "show_last_play": {
       "type": "boolean",
@@ -163,56 +224,15 @@
       "default": "significant",
       "description": "significant = only flash for hits/walks/strikeouts/outs/runs (skips routine ball/strike/foul updates). all = flash for every single play update including pitch-by-pitch."
     },
-    "show_past_games": {
+    "last_play_favorites_only": {
       "type": "boolean",
       "default": false,
-      "description": "Include recently completed favorite-team games in the rotation, showing the final score with the winning team highlighted in yellow and \"FINAL\" on the black half."
+      "description": "Restrict the last-play flash/interrupt system to favorite-team games only. Different from show_favorite_teams_only above: that controls which games appear in rotation at all; this controls which games are allowed to INTERRUPT that rotation with a flash. Useful when show_favorite_teams_only is off (all live games rotate normally) but you only want YOUR team's big moments to interrupt that rotation, not every other simultaneous game's."
     },
-    "show_upcoming_games": {
+    "show_home_run_animation": {
       "type": "boolean",
-      "default": false,
-      "description": "Include upcoming scheduled favorite-team games in the rotation (in start-time order), showing \"UPCOMING\" plus the date/time on the black half. No score is shown since the game hasn't started."
-    },
-    "max_past_games": {
-      "type": "integer",
-      "default": 3,
-      "minimum": 1,
-      "description": "Maximum number of past (final) favorite-team games to include in rotation"
-    },
-    "max_upcoming_games": {
-      "type": "integer",
-      "default": 3,
-      "minimum": 1,
-      "description": "Maximum number of upcoming favorite-team games to include in rotation"
-    },
-    "past_upcoming_all_teams": {
-      "type": "boolean",
-      "default": false,
-      "description": "Only relevant when show_favorite_teams_only is off. When no favorite team is live, this controls whether past/upcoming games expand to include all teams (true) or stay scoped to favorite teams only (false, default). Ignored (always favorites-only) when show_favorite_teams_only is on."
-    },
-    "upcoming_games_lookahead_days": {
-      "type": "integer",
-      "default": 5,
-      "minimum": 1,
-      "description": "How many days ahead to explicitly check for upcoming favorite-team games. ESPN's scoreboard endpoint only returns TODAY's games by default, so this queries additional future days individually (one extra request per day) to actually find a team's next scheduled game."
-    },
-    "upcoming_games_refresh_seconds": {
-      "type": "integer",
-      "default": 1800,
-      "minimum": 60,
-      "description": "How often to re-run the future-days lookahead (separate from the main scoreboard poll interval, since schedules barely change within a day -- no need to re-check every 15 seconds during a live game)."
-    },
-    "past_games_lookback_days": {
-      "type": "integer",
-      "default": 3,
-      "minimum": 1,
-      "description": "How many days back to explicitly check for a favorite team's completed games. ESPN's scoreboard endpoint only returns TODAY's games by default, so this queries additional past days individually (one extra request per day) to actually find a team's most recent finished game if it wasn't today."
-    },
-    "past_games_refresh_seconds": {
-      "type": "integer",
-      "default": 1800,
-      "minimum": 60,
-      "description": "How often to re-run the past-days lookback (separate from the main scoreboard poll interval, since completed games don't change)."
+      "default": true,
+      "description": "Play the full 3-phase home run animation (ball arc, strobe, fireworks+scrolling text) instead of the plain last-play text overlay when a home run is detected. When off, home runs just use the regular last-play flash like any other significant play, and use last_play_display_seconds instead of home_run_display_seconds for their duration."
     },
     "home_run_display_seconds": {
       "type": "number",
@@ -220,10 +240,10 @@
       "minimum": 1,
       "description": "How long the home run animation plays, independent of last_play_display_seconds -- the 3-phase animation (ball arc, strobe, fireworks+scrolling text) needs more time than a plain text flash to play out fully."
     },
-    "last_play_favorites_only": {
+    "test_mode": {
       "type": "boolean",
       "default": false,
-      "description": "Restrict the last-play flash/interrupt system to favorite-team games only, independent of overall rotation scope. Useful when show_favorite_teams_only is off (all live games rotate normally) but you only want YOUR team's big moments to interrupt that rotation, not every other simultaneous game's."
+      "description": "Render a fake in-progress game instead of calling ESPN (for layout testing)"
     }
   },
   "required": [

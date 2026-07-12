@@ -416,6 +416,10 @@ class TidbytBaseballPlugin(BasePlugin):
         self.out_empty_color = tuple(cfg.get("out_empty_color", [120, 120, 120]))
         self.font_choice = "tom_thumb"  # no longer user-configurable -- see FONT_CHOICES for fallback chain if this fails to load
         self.show_batter_name = cfg.get("show_batter_name", True)
+        self.show_pitcher_name = cfg.get("show_pitcher_name", True)
+        self.show_pitch_count = cfg.get("show_pitch_count", True)
+        self.show_delayed_overlay = cfg.get("show_delayed_overlay", True)
+        self.show_home_run_animation = cfg.get("show_home_run_animation", True)
         self.show_last_play = cfg.get("show_last_play", True)
         self.last_play_display_seconds = cfg.get("last_play_display_seconds", 5)
         self.home_run_display_seconds = cfg.get("home_run_display_seconds", 10)
@@ -1055,7 +1059,7 @@ class TidbytBaseballPlugin(BasePlugin):
                         break
 
                 duration = self.last_play_display_seconds
-                if matched_game and self._is_home_run_play(
+                if self.show_home_run_animation and matched_game and self._is_home_run_play(
                     matched_game.get("last_play_type") or "", matched_game.get("last_play_text") or ""
                 ):
                     duration = self.home_run_display_seconds
@@ -2003,7 +2007,7 @@ class TidbytBaseballPlugin(BasePlugin):
             if show_flash:
                 play_type = (game.get("last_play_type") or "")
                 play_text_for_detection = game.get("last_play_text") or ""
-                if self._is_home_run_play(play_type, play_text_for_detection):
+                if self.show_home_run_animation and self._is_home_run_play(play_type, play_text_for_detection):
                     elapsed = time.time() - active_flash["started_at"]
                     batting_color = game["away_color"] if game["inning_half"] else game["home_color"]
                     self._draw_home_run_animation(
@@ -2016,7 +2020,7 @@ class TidbytBaseballPlugin(BasePlugin):
                         image, draw, right_x0, 0, right_w, height,
                         game.get("last_play_text") or "", fill=(255, 255, 255),
                     )
-            elif game.get("is_delayed"):
+            elif game.get("is_delayed") and self.show_delayed_overlay:
                 # Replace the whole right half with "DELAYED" in red
                 # until the game resumes -- there's no live situation
                 # worth showing (pitch count, batter, diamond, etc. are
@@ -2046,7 +2050,10 @@ class TidbytBaseballPlugin(BasePlugin):
                 # identical across every game regardless of its data.
                 pitch_row_reserved_h = 6
                 has_batter = bool(game.get("batter_name") or game.get("batter_short_name"))
-                has_pitcher = bool(game.get("pitcher_name") or game.get("pitcher_short_name"))
+                shown_pitcher_name = game.get("pitcher_name") if self.show_pitcher_name else None
+                shown_pitcher_short = game.get("pitcher_short_name") if self.show_pitcher_name else None
+                shown_pitch_count = game.get("pitch_count") if self.show_pitch_count else None
+                has_pitcher = bool(shown_pitcher_name or shown_pitcher_short or shown_pitch_count is not None)
                 if not has_batter and not has_pitcher:
                     # Mid-inning gap in ESPN's data (between at-bats, after
                     # a play, etc.) -- show who's due up next instead of
@@ -2056,7 +2063,7 @@ class TidbytBaseballPlugin(BasePlugin):
                 else:
                     self._draw_pitch_info(
                         image, draw, right_x0 + 1, top_margin, right_w - 2,
-                        game.get("pitch_count"), game.get("pitcher_name"), game.get("pitcher_short_name"),
+                        shown_pitch_count, shown_pitcher_name, shown_pitcher_short,
                     )
 
                 # --- Middle: diamond centered, inning (left) and outs
@@ -2998,11 +3005,25 @@ class TidbytBaseballPlugin(BasePlugin):
         silently skipped the way it was before.
 
         If there's no pitcher name at all, draws nothing and returns 0
-        so the diamond simply moves up to fill the freed space."""
-        if not pitcher_name and not pitcher_short_name:
+        so the diamond simply moves up to fill the freed space.
+
+        Handles all four combinations of name/count presence (both,
+        name only, count only, neither) -- added so show_pitcher_name
+        and show_pitch_count can be toggled independently rather than
+        being all-or-nothing together."""
+        if not pitcher_name and not pitcher_short_name and pitch_count is None:
             return 0
 
-        name = pitcher_short_name or self._format_batter_name(pitcher_name)
+        name = (pitcher_short_name or self._format_batter_name(pitcher_name)) if (pitcher_name or pitcher_short_name) else None
+
+        if name is None:
+            # Count only, no name -- simple fixed string, no tightening needed.
+            text = f"P:{pitch_count}"
+            font = self._fit_font_for_width(draw, text, max_width, start_size=7, min_size=4)
+            self._render_text(image, (x, y), text, font, (180, 180, 220))
+            bbox = self._measure(font, text)
+            return bbox[3] - bbox[1]
+
         color = (180, 180, 220)
         sizing_text = f"P:{pitch_count} {name}" if pitch_count is not None else name
         font = self._fit_font_for_width(draw, sizing_text, max_width, start_size=7, min_size=4)

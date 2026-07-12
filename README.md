@@ -216,6 +216,63 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Config review: fixed outdated docs, added 4 missing toggles, reordered everything
+
+Did a full audit of all 32 settings for clarity/accuracy/gaps, per
+request. Findings and fixes:
+
+**Outdated descriptions (were just wrong, not style)**:
+- `past_upcoming_all_teams` still described the OLD "only checks if a
+  favorite is live" behavior -- doesn't mention the liveness-aware fix
+  from a couple rounds back (now applies whenever ANYTHING is live,
+  favorite or not). Updated to reflect actual current behavior.
+- `game_rotation_seconds` said "each live game" -- rotation includes
+  past/upcoming too now. Updated.
+
+**Naming collision clarified**: `display_duration` (whole-plugin
+rotation in the broader LEDMatrix system) vs `game_rotation_seconds`
+(game-to-game rotation within this plugin) -- similar enough names
+that they're easy to confuse. Both descriptions now explicitly
+cross-reference and distinguish each other.
+
+**Non-obvious interactions now documented**: `use_team_colors` silently
+overriding `away_color`/`home_color` (now stated on both sides);
+`last_play_favorites_only` vs `show_favorite_teams_only` being two
+different "favorites only" concepts controlling different things (now
+cross-referenced).
+
+**Four new toggles, closing real gaps that had no setting at all**:
+- `show_pitcher_name` / `show_pitch_count` -- independent toggles,
+  mirroring the existing `show_batter_name`. Tested all four
+  combinations (both on, name-only, count-only, both off) -- each
+  renders correctly, including the previously-impossible "count
+  without a name" case, which required handling in
+  `_draw_pitch_info` itself, not just gating at the call site.
+- `show_delayed_overlay` -- the DELAYED feature had zero way to turn
+  it off. Verified disabling it correctly suppresses the red text.
+- `show_home_run_animation` -- no way to keep regular last-play
+  flashes while disabling just the home run animation specifically.
+  When off, home runs fall back to the plain last-play overlay and
+  correctly use `last_play_display_seconds` instead of
+  `home_run_display_seconds` for timing (verified the duration
+  selection itself respects the toggle, not just the animation call).
+
+**Reordered all 36 settings into logical groups**: core -> timing ->
+favorite-team scope -> past games -> upcoming games -> logos/colors ->
+live-game info toggles -> last-play/flash system -> testing. Rebuilt
+`example_config.json` to match the new order and include the new
+settings.
+
+**Verified end-to-end, not just JSON-valid**: cross-referenced every
+schema key against actual `cfg.get()` calls in the code -- confirmed
+zero orphaned settings (schema entries the code never reads) and zero
+undocumented settings (code reading something with no schema entry),
+aside from the expected `enabled` field which is read by the broader
+plugin framework rather than this plugin's own code. Ran the full
+smoke test using the actual rebuilt `example_config.json` file
+directly (not just hand-picked test values) to confirm it genuinely
+works end to end.
+
 ## Fixed: home team's logo box was visibly smaller than away's
 
 Confirmed via direct pixel measurement: away's box measured a full
