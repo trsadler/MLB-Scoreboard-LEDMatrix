@@ -216,6 +216,29 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: real regression -- DUE UP stopped triggering during genuine data gaps
+
+Confirmed via a real screenshot: a mid-inning gap showed a floating
+"P:13" with no batter name and no "DUE UP" fallback -- looked broken.
+Root cause was a real regression from the pitcher-toggle changes: the
+DUE-UP decision (`has_pitcher`) got accidentally coupled to the new
+`show_pitch_count` toggle's output, so pitch count alone (which can
+genuinely persist in ESPN's data even when the pitcher's NAME and the
+batter are both missing) was enough to satisfy "has a pitcher" and
+block DUE UP from showing -- even though there was no actually useful
+pitcher info to show instead.
+
+Fixed by separating two different questions that had gotten
+conflated: whether a pitcher genuinely EXISTS in the data (for
+deciding DUE UP) is now based strictly on the raw pitcher name field,
+never the display toggles or pitch count. Whether that pitcher's info
+gets DISPLAYED is still controlled by show_pitcher_name/
+show_pitch_count as intended, just no longer entangled with the DUE-UP
+decision. Reproduced the exact reported scenario (pitch count present,
+pitcher name and batter both missing) and confirmed DUE UP now
+triggers correctly; re-verified both of the toggle-combination tests
+from the original feature still pass too.
+
 ## Config review: fixed outdated docs, added 4 missing toggles, reordered everything
 
 Did a full audit of all 32 settings for clarity/accuracy/gaps, per

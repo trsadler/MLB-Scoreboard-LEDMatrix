@@ -2050,10 +2050,23 @@ class TidbytBaseballPlugin(BasePlugin):
                 # identical across every game regardless of its data.
                 pitch_row_reserved_h = 6
                 has_batter = bool(game.get("batter_name") or game.get("batter_short_name"))
+                # IMPORTANT: this must be based on the RAW pitcher name
+                # data, NOT the display toggles or pitch count -- a real
+                # regression confirmed via a live screenshot: pitch
+                # count can genuinely persist in ESPN's data even during
+                # a mid-inning gap where the pitcher NAME and batter are
+                # both missing, and previously counting "has a pitch
+                # count" as "has a pitcher" blocked DUE UP from
+                # triggering, leaving a floating "P:13" with no batter
+                # name and no DUE-UP fallback -- confusing/broken-looking
+                # either way. Whether a pitcher genuinely exists (for
+                # deciding DUE UP) and whether their info is DISPLAYED
+                # (show_pitcher_name/show_pitch_count) are two different
+                # questions -- conflating them caused this.
+                has_pitcher = bool(game.get("pitcher_name") or game.get("pitcher_short_name"))
                 shown_pitcher_name = game.get("pitcher_name") if self.show_pitcher_name else None
                 shown_pitcher_short = game.get("pitcher_short_name") if self.show_pitcher_name else None
                 shown_pitch_count = game.get("pitch_count") if self.show_pitch_count else None
-                has_pitcher = bool(shown_pitcher_name or shown_pitcher_short or shown_pitch_count is not None)
                 if not has_batter and not has_pitcher:
                     # Mid-inning gap in ESPN's data (between at-bats, after
                     # a play, etc.) -- show who's due up next instead of
