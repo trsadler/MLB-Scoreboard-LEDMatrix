@@ -1416,7 +1416,21 @@ class TidbytBaseballPlugin(BasePlugin):
         results = []
         today = datetime.datetime.now()
 
-        for offset in range(1, self.upcoming_games_lookahead_days + 1):
+        # IMPORTANT: starts at offset=0 (TODAY), not 1 -- confirmed via
+        # a real log from ~2:20am showing "10 past, 0 upcoming" despite
+        # games actually being scheduled that day. Root cause: this
+        # only used to look FORWARD from tomorrow, on the assumption
+        # that the main scoreboard fetch (no date param) always covers
+        # today -- true most of the time, but near midnight ESPN's own
+        # "today" can still reflect the previous calendar day for a
+        # while, leaving a real gap where NEITHER fetch covers what the
+        # local clock considers "today" specifically. Querying today
+        # explicitly here closes that gap. Harmless during normal
+        # daytime hours -- if the main fetch already found today's
+        # upcoming games correctly, this just re-finds the same ones,
+        # and they're deduped by event_id when merged back in
+        # _maybe_refresh.
+        for offset in range(0, self.upcoming_games_lookahead_days + 1):
             day = today + datetime.timedelta(days=offset)
             date_param = day.strftime("%Y%m%d")
             try:

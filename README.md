@@ -216,6 +216,26 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: upcoming games disappearing near midnight
+
+Real log confirmed the exact symptom: "10 past, 0 upcoming" at
+2:21am, despite games actually being scheduled that day. Root cause:
+the upcoming-games lookahead only ever looked forward starting from
+*tomorrow*, on the assumption that the main scoreboard fetch (no date
+parameter) always covers today -- true most of the time, but near
+midnight ESPN's own "today" can still reflect the previous calendar
+day for a while, leaving a real gap where NEITHER fetch covers what
+the local clock considers "today."
+
+Fixed by extending the lookahead to explicitly include today
+(offset=0) as a redundant check -- harmless the rest of the day, since
+if the main fetch already found today's games correctly this just
+re-finds the same ones (deduped by event_id when merged). Tested the
+exact scenario from the log: a main fetch returning only finished
+games (simulating ESPN's lagging "today"), with a real upcoming game
+for the local date that only the explicit same-day query finds --
+confirmed it's now correctly picked up.
+
 ## Fixed: UPCOMING/date/time text was measurably off-center
 
 Confirmed real via direct pixel measurement (not just visual
