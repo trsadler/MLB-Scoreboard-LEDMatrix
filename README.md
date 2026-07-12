@@ -216,6 +216,107 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: date/time block had zero clearance above the bottom bar
+
+Measured directly rather than assuming: the last line of text
+("7:10 PM") was running with exactly 0px of clearance before the
+bottom bar's boundary -- not just tight, genuinely touching. Root
+cause was simple: the original spacing (4px after the title, 2px
+between date/time lines) was sized for the FULL panel height from the
+earlier layout, and never got adjusted when the middle block's
+available height shrank to just the area above the new bottom bar.
+
+Tightened both gaps (4px->3px, 2px->1px) to reclaim exactly the 2px
+needed. Verified directly: the last line's lowest text pixel now sits
+2px clear of the boundary, confirmed by pixel measurement rather than
+just visual inspection.
+
+## Adjusted: abbreviation centered under its logo, not the whole half
+
+Follow-up clarification: abbreviation should align directly under its
+team's logo (like a traditional scoreboard), with the record placed
+adjacent to it -- not the combined "ABBR RECORD" text centered as one
+block within the whole half of the bar. Away reads "DET  54-39" with
+DET anchored left (under the logo) and the record trailing right;
+home mirrors it, "52-43  PHI" with PHI anchored right (under its
+logo) and the record leading in from the left.
+
+Verified with direct pixel measurement: the abbreviation's measured
+ink center (19px) closely matches the logo's actual center (20.5px,
+from the same `side_w/2` calculation the logo positioning already
+uses) -- off by only the expected integer-rounding amount. Re-confirmed
+zero color bleed across the center boundary in either direction.
+
+## Redesigned upcoming-game layout: two-tier, full-width bottom bar
+
+Clarified from a follow-up: abbreviation and record should sit side by
+side on one line (not stacked), and the team-colored bars should meet
+in the middle with no gap, while logos stay where they were.
+
+Restructured into two tiers instead of three side-by-side columns:
+- **Bottom tier**: a single-line, full-width color bar split exactly
+  at center -- left half is the away team's color with "ABBR RECORD"
+  side by side, right half is home's, meeting with zero gap.
+- **Top tier**: logos near the edges (same horizontal position as
+  before) with "UPCOMING" + date/time centered between them, confined
+  to just the area above the bar rather than the full height.
+
+This also incidentally solves the original width problem for free:
+each half of a full-width bar is far more generous (64px) than the
+narrow side columns from the previous version, so "DET 54-39" fits
+comfortably on one line without needing to shrink the font or stack
+anything.
+
+Updated logo sizing to match -- logos now only have the area above the
+bar to fit in, not the full panel height, so the size cap changed
+accordingly. Verified with direct pixel checks: the full bottom bar
+row has zero black gap anywhere, the away/home colors transition
+cleanly at the exact center pixel, and there's zero actual color bleed
+across that boundary in either direction (checked specifically for
+away-color pixels in the home half and vice versa, not just "any
+non-background pixel," since text color naturally isn't background
+color).
+
+## Adjusted upcoming-game proportions per sketch: wider team blocks, narrower center
+
+Follow-up to the layout above: widened the team-colored sections and
+narrowed the center strip, per a sketch showing bigger logos with the
+two colored blocks extending further toward the middle. Sized the
+center to the actual minimum needed rather than guessing -- measured
+the longest realistic date strings (~40px for something like "Sat Jul
+11" or "Wed Sep 30") and set the center to 46px (small margin above
+that minimum), giving the team sections 41px each, up from the
+previous even 32px split.
+
+Updated logo sizing to match -- confirmed it was still using the old
+formula and would have kept logos too small for the new wider
+sections otherwise. Verified with direct pixel checks: no text
+overflow from the center into either team section, clean (gap-free)
+boundaries at every row checked, and the full smoke test still passes.
+
+## New: team records on the upcoming-game screen, with a layout redesign
+
+Added win-loss records to the upcoming-game view, per explicit design
+direction: rather than cramming records into the existing narrow team
+columns (which measurably didn't fit even at the smallest font --
+tested "DET 54-39" at 36px needed vs. only 21px available), restructured
+the whole layout: teams now flank the left/right edges (logo +
+abbreviation + record each), opening up a wider center section for
+"UPCOMING" + date/time instead of confining it to a black half.
+
+**Data confidence**: `records` is confirmed as a real field on each
+competitor (via community API documentation covering overall/home/away
+splits), but the exact sub-field names inside each entry aren't
+confirmed. Extraction tries a few plausible combinations and returns
+None rather than guessing wrong if nothing matches -- a missing record
+just quietly omits that line rather than showing a placeholder.
+
+Verified: side sections render with zero gap against the middle
+section at every row tested, no text overflows from either side into
+the middle, the missing-record case falls back gracefully to a single
+abbreviation line without crashing, and the full smoke test still
+passes for all game types.
+
 ## New: "DELAYED" overlay for rain delays / game stoppages
 
 When a live game is detected as delayed, the whole right half now

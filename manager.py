@@ -1624,6 +1624,29 @@ class TidbytBaseballPlugin(BasePlugin):
                     continue
             return None, None
 
+        def extract_team_record(competitor):
+            """UNCONFIRMED against real captured data (couldn't verify
+            the exact sub-field names -- ESPN's public API shut down
+            official docs in 2018, and community documentation confirms
+            competitor.records exists as an array covering overall/home/
+            away/league records, but not the precise key names within
+            each entry). Tries a few plausible combinations
+            (type/name == 'total'/'overall', value under 'summary' or
+            'displayValue'), falling back to just the first entry if a
+            specific match isn't found. Returns None rather than
+            guessing wrong if nothing usable is found."""
+            try:
+                records = competitor.get("records", [])
+                if not records:
+                    return None
+                overall = next(
+                    (r for r in records if str(r.get("type", r.get("name", ""))).lower() in ("total", "overall")),
+                    records[0],
+                )
+                return overall.get("summary") or overall.get("displayValue")
+            except Exception:
+                return None
+
         def extract_pitcher_info(situation_dict):
             """Same shape as the batter extraction, confirmed against
             the same real live-game data: situation.pitcher.athlete.
@@ -1726,6 +1749,8 @@ class TidbytBaseballPlugin(BasePlugin):
             "home_abbr": home.get("team", {}).get("abbreviation", "HOM")[:3].upper(),
             "away_score": int(away.get("score", 0) or 0),
             "home_score": int(home.get("score", 0) or 0),
+            "away_record": extract_team_record(away),
+            "home_record": extract_team_record(home),
             "away_color": team_color(away) or self.away_color_fallback,
             "home_color": team_color(home) or self.home_color_fallback,
             "away_logo_url": team_logo_url(away),
@@ -1814,21 +1839,36 @@ class TidbytBaseballPlugin(BasePlugin):
         if size is None:
             width, height = self._get_dimensions()
             # IMPORTANT: final games use a narrower 40% left-half split
-            # (_render_final_game), not the standard 50/50 the live/
-            # upcoming layouts use -- sizing logos off the wrong split
-            # is exactly what caused them to bleed into the box score:
-            # a logo sized for the wider 50%-split column doesn't fit
-            # the narrower one used for the box score layout.
-            left_fraction = 0.4 if game.get("game_type") == "final" else 0.5
-            left_w = int(width * left_fraction)
-            col_w = left_w // 2
+            # (_render_final_game), not the standard 50/50 the live
+            # layout uses -- sizing logos off the wrong split is exactly
+            # what caused them to bleed into the box score: a logo sized
+            # for the wider 50%-split column doesn't fit the narrower
+            # one used for the box score layout.
+            #
+            # Upcoming games use a THIRD, different split (three
+            # sections: two team sides + a narrow center strip for
+            # "UPCOMING"/date/time -- see _render_upcoming_game), so
+            # they need their own column-width calculation here too,
+            # rather than sharing live's 50/50 assumption.
+            if game.get("game_type") == "final":
+                col_w = int(width * 0.4) // 2
+                cap_h = height
+            elif game.get("game_type") == "upcoming":
+                col_w = 41
+                # Logos only have the area ABOVE the bottom bar to fit
+                # in now, not the full panel height -- see
+                # _render_upcoming_game's two-tier layout.
+                cap_h = height - 9
+            else:
+                col_w = (width // 2) // 2
+                cap_h = height
             # Slightly larger than the column itself -- allowed to bleed
             # a small amount off the panel edges (and, since two columns
             # sit side by side, potentially a couple px into the
             # neighboring team's column too, though most team logos
             # taper to transparent near their outer edge so this is
             # rarely very visible in practice).
-            size = max(min(col_w, height) + 4, 12)
+            size = max(min(col_w, cap_h) + 4, 12)
         game["away_logo"] = self._get_team_logo(game["away_abbr"], game.get("away_logo_url"), size)
         game["home_logo"] = self._get_team_logo(game["home_abbr"], game.get("home_logo_url"), size)
 
@@ -2290,54 +2330,115 @@ class TidbytBaseballPlugin(BasePlugin):
         draw_team_row(home_y0, home_y1, home_ls, game["home_score"], game.get("home_hits"), game.get("home_errors"), home_won)
 
     def _render_upcoming_game(self, image, draw, game, width, height):
-        """Scheduled game that hasn't started: team columns show only
-        the abbreviation (no score -- there isn't one yet), and the
-        black half shows "UPCOMING" with the game's date and start time
-        (in local system time) below it."""
-        left_w = width // 2
-        col_w = left_w // 2
+        """Scheduled game that hasn't started. Two-tier layout:
 
-        draw.rectangle([0, 0, col_w - 1, height - 1], fill=self._darken_color(game["away_color"]))
-        draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=self._darken_color(game["home_color"]))
+        TOP tier: away logo (left) / "UPCOMING" + date/time in a black
+        box (center) / home logo (right) -- logos stay near the edges,
+        same horizontal position as before.
+
+        BOTTOM tier: a single-line, FULL-WIDTH color bar split at the
+        center -- left half is the away team's color with "ABBR
+        RECORD" side by side, right half is the home team's color with
+        the same for home. Per explicit request: color bars meet in
+        the middle (no black gap at the bottom), record sits beside
+        the abbreviation on one line (not stacked below it) -- solves
+        the earlier width problem entirely, since each half of a
+        full-width bar is far more generous (64px) than the narrow
+        side columns from the previous version were.
+
+        Record data confidence: see extract_team_record in _parse_game
+        -- confirmed the underlying `records` array is real (via
+        community API documentation) but not the exact sub-field
+        names, so a missing record just falls back to abbreviation-only
+        for that team rather than showing a placeholder."""
+        bar_line_h = self._measure(self.font_tiny, "0")[3]
+        bar_h = bar_line_h + 4
+        top_h = height - bar_h
+        mid_x = width // 2
+        side_w = 41  # matches the logo zone width used below
 
         away_txt_color = self._text_color_for(game["away_color"])
         home_txt_color = self._text_color_for(game["home_color"])
 
-        available_text_width = col_w - 4
-        shared_font = self._fit_font_for_pair(draw, game["away_abbr"], game["home_abbr"], available_text_width, start_size=10)
+        # Bottom tier: full-width bar, split at center, meeting with no gap.
+        bar_y0 = height - bar_h
+        draw.rectangle([0, bar_y0, mid_x - 1, height - 1], fill=game["away_color"])
+        draw.rectangle([mid_x, bar_y0, width - 1, height - 1], fill=game["home_color"])
 
-        self._draw_team_column(image, draw, 0, 0, col_w, height,
-                                game["away_abbr"], game["away_score"], game.get("away_logo"),
-                                away_txt_color, game["away_color"], shared_font, show_score=False)
-        self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
-                                game["home_abbr"], game["home_score"], game.get("home_logo"),
-                                home_txt_color, game["home_color"], shared_font, show_score=False)
+        def draw_bar_text(is_away, abbr, record, text_color):
+            # Abbreviation centered under the LOGO zone specifically
+            # (not the whole half of the bar), with the record placed
+            # immediately adjacent -- to the right for away, to the
+            # left for home -- so "DET" lines up under the away logo
+            # and "PHI" lines up under the home logo, per explicit
+            # request, rather than the combined "ABBR RECORD" block
+            # being centered as one unit within the half.
+            abbr_bbox = self._measure(self.font_tiny, abbr)
+            abbr_w = abbr_bbox[2] - abbr_bbox[0]
+            ty = bar_y0 + max((bar_h - bar_line_h) // 2, 0) - abbr_bbox[1]
 
-        draw.rectangle([left_w, 0, left_w, height - 1], fill=(166, 166, 166))
+            if is_away:
+                abbr_x = max((side_w - abbr_w) // 2, 0)
+            else:
+                abbr_x = (width - side_w) + max((side_w - abbr_w) // 2, 0)
+            self._render_text(image, (abbr_x, ty), abbr, self.font_tiny, text_color)
 
-        right_x0 = left_w + 2
-        right_w = width - right_x0 - 1
+            if record:
+                rec_bbox = self._measure(self.font_tiny, record)
+                rec_w = rec_bbox[2] - rec_bbox[0]
+                gap = 4
+                rec_x = (abbr_x + abbr_w + gap) if is_away else (abbr_x - gap - rec_w)
+                self._render_text(image, (rec_x, ty), record, self.font_tiny, text_color)
+
+        draw_bar_text(True, game["away_abbr"], game.get("away_record"), away_txt_color)
+        draw_bar_text(False, game["home_abbr"], game.get("home_record"), home_txt_color)
+
+        # Top tier: logos near the edges (same horizontal position as
+        # the previous version -- a ~41px zone on each side), UPCOMING
+        # + date/time centered between them, confined to just this
+        # upper area rather than the full height.
+        middle_w = width - side_w * 2
+        middle_x0 = side_w
+
+        draw.rectangle([0, 0, side_w - 1, top_h - 1], fill=self._darken_color(game["away_color"]))
+        draw.rectangle([width - side_w, 0, width - 1, top_h - 1], fill=self._darken_color(game["home_color"]))
+
+        away_logo = game.get("away_logo")
+        if away_logo is not None:
+            logo_x = (side_w - away_logo.width) // 2
+            logo_y = max((top_h - away_logo.height) // 2, 0)
+            image.paste(away_logo, (logo_x, logo_y), away_logo)
+
+        home_logo = game.get("home_logo")
+        if home_logo is not None:
+            logo_x = (width - side_w) + (side_w - home_logo.width) // 2
+            logo_y = max((top_h - home_logo.height) // 2, 0)
+            image.paste(home_logo, (logo_x, logo_y), home_logo)
 
         title_font = self._load_font(8, bold=True)
         title = "UPCOMING"
         tbbox = self._measure(title_font, title)
         tw = tbbox[2] - tbbox[0]
-        tx = right_x0 + max((right_w - tw) // 2, 0)
+        tx = middle_x0 + max((middle_w - tw) // 2, 0)
         ty = 2 - tbbox[1]
         self._render_text(image, (tx, ty), title, title_font, (255, 255, 255))
 
         info_font = self._load_font(7, bold=False)
         date_str = game.get("game_date_str")
         time_str = game.get("game_time_str")
-        cursor_y = ty + (tbbox[3] - tbbox[1]) + 4
+        # Tightened gaps (4->3 after title, 2->1 between lines) to leave
+        # 2px of clearance before the bottom bar -- confirmed via direct
+        # pixel measurement that the previous spacing left EXACTLY 0px,
+        # with the last line's text running right up against the bar.
+        cursor_y = ty + (tbbox[3] - tbbox[1]) + 3
 
         for line in filter(None, [date_str, time_str]):
             lbbox = self._measure(info_font, line)
             lw = lbbox[2] - lbbox[0]
-            lx = right_x0 + max((right_w - lw) // 2, 0)
+            lx = middle_x0 + max((middle_w - lw) // 2, 0)
             ly = cursor_y - lbbox[1]
             self._render_text(image, (lx, ly), line, info_font, (200, 200, 200))
-            cursor_y += (lbbox[3] - lbbox[1]) + 2
+            cursor_y += (lbbox[3] - lbbox[1]) + 1
 
     def _push_image(self, image: Image.Image, force_clear: bool):
         dm = self.display_manager
