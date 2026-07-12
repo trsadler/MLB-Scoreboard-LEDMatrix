@@ -2497,8 +2497,18 @@ class TidbytBaseballPlugin(BasePlugin):
         stroke_w = 2
         # Right edge of away block / left edge of home block (top tier
         # verticals, spanning just the logo area above the bar).
+        #
+        # IMPORTANT: confirmed via pixel measurement that these were
+        # NOT symmetric -- the away stroke sits just outside away's own
+        # box (doesn't touch its 0-40 range at all), but the home
+        # stroke was positioned AT width-side_w, which is home's own
+        # box's start, eating into its first 2 columns. Away's visible
+        # box measured a full 41px, home's only 39px -- exactly the
+        # "home side looks smaller" report. Fixed by moving the home
+        # stroke to sit just outside home's box too (mirroring away),
+        # so both boxes keep their full width.
         draw.rectangle([side_w, 0, side_w + stroke_w - 1, top_h - 1], fill=STROKE)
-        draw.rectangle([width - side_w, 0, width - side_w + stroke_w - 1, top_h - 1], fill=STROKE)
+        draw.rectangle([width - side_w - stroke_w, 0, width - side_w - 1, top_h - 1], fill=STROKE)
         # Horizontal, full width, across the top of the record bar.
         draw.rectangle([0, top_h, width - 1, top_h + stroke_w - 1], fill=STROKE)
         # Vertical, down the middle of the record bar where the two

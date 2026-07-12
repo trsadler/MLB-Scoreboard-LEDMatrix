@@ -216,6 +216,17 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: home team's logo box was visibly smaller than away's
+
+Confirmed via direct pixel measurement: away's box measured a full
+41px of visible colored area, home's only 39px. Root cause was an
+asymmetry in the grid strokes added a couple rounds back -- the away
+stroke was positioned just outside away's own box (never touching its
+0-40 range), but the home stroke was placed AT the start of home's
+box, eating into its first 2 columns. Fixed by moving the home stroke
+to mirror the away one -- just outside home's box instead of
+overlapping it. Verified both boxes now measure exactly 41px.
+
 ## Fixed: upcoming games disappearing near midnight
 
 Real log confirmed the exact symptom: "10 past, 0 upcoming" at
