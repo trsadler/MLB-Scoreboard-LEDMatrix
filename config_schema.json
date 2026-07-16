@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Tidbyt-Style Baseball Scoreboard",
+  "title": "MLB Scoreboard for LEDMatrix",
   "type": "object",
   "properties": {
     "enabled": {

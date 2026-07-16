@@ -1,5 +1,5 @@
 """
-Tidbyt-Style Baseball Scoreboard plugin for ChuckBuilds/LEDMatrix.
+MLB Scoreboard plugin for ChuckBuilds/LEDMatrix.
 
 Layout:
   - Left half: two team columns side by side, each full panel height.
@@ -1946,6 +1946,40 @@ class TidbytBaseballPlugin(BasePlugin):
             self._maybe_rotate()
 
         width, height = self._get_dimensions()
+
+        # This plugin's layouts (box score column widths, upcoming-game
+        # section boundaries, etc.) are hand-tuned pixel-exact for a
+        # 128x32 panel specifically -- confirmed via direct testing that
+        # they genuinely collide/overlap on narrower panels (e.g. a
+        # single 64x32 panel), not just look cramped. Rather than
+        # silently rendering a broken/garbled layout on an incompatible
+        # panel, show a clear message instead. This message itself IS
+        # written to work at any size, using width/height directly
+        # rather than the fixed 128x32 assumptions the rest of the
+        # plugin currently has.
+        if (width, height) != (128, 32):
+            image = Image.new("RGB", (width, height), (0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            font = self._load_font(max(min(width, height) // 4, 5), bold=True)
+            lines = ["128x32", "required"]
+            line_hs = []
+            total_h = 0
+            for line in lines:
+                bbox = self._measure(font, line)
+                lh = bbox[3] - bbox[1]
+                line_hs.append(lh)
+                total_h += lh + 1
+            cursor_y = max((height - total_h) // 2, 0)
+            for line, lh in zip(lines, line_hs):
+                bbox = self._measure(font, line)
+                lw = bbox[2] - bbox[0]
+                lx = max((width - lw) // 2, 0)
+                ly = cursor_y - bbox[1]
+                self._render_text(image, (lx, ly), line, font, (255, 120, 0))
+                cursor_y += lh + 1
+            self._push_image(image, force_clear)
+            return
+
         image = Image.new("RGB", (width, height), (0, 0, 0))
         draw = ImageDraw.Draw(image)
 

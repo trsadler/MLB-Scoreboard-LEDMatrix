@@ -1,4 +1,15 @@
-# Tidbyt-Style Baseball Scoreboard (LEDMatrix plugin)
+# MLB Scoreboard for LEDMatrix
+
+> **⚠️ Panel size: 128x32 only (currently).** Every layout in this
+> plugin is hand-tuned pixel-exact for a 128x32 panel (two 64x32
+> panels chained) -- confirmed via direct testing that several layouts
+> genuinely collide/overlap on other sizes (a 64x32 single panel, for
+> example), not just look cramped. On any other panel size, the plugin
+> shows a clear "128x32 required" message instead of a broken layout.
+> Making this size-adaptive is a real, larger undertaking (going
+> through every hardcoded pixel constant and converting it to a
+> width/height-relative formula) that hasn't been done yet -- if
+> that's something you want to help with, contributions welcome.
 
 A custom MLB scoreboard for [ChuckBuilds/LEDMatrix](https://github.com/ChuckBuilds/LEDMatrix),
 built for a 128x32 panel: two team columns on the left (big logo, bold
