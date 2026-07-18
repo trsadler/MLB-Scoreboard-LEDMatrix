@@ -53,6 +53,12 @@ try:
     from src.plugin_system.base_plugin import BasePlugin
 except ImportError:
     class BasePlugin:  # type: ignore
+        """Local fallback ONLY for sandbox testing when the real
+        LEDMatrix framework isn't installed -- on real deployments the
+        import above succeeds and this class is never used. Mirrors the
+        real BasePlugin's live-priority defaults (confirmed directly
+        from the user's own installed base_plugin.py source) so sandbox
+        tests here accurately reflect real integration behavior."""
         def __init__(self, plugin_id, config, display_manager, cache_manager, plugin_manager):
             self.plugin_id = plugin_id
             self.config = config
@@ -60,6 +66,18 @@ except ImportError:
             self.cache_manager = cache_manager
             self.plugin_manager = plugin_manager
             self.logger = logging.getLogger(plugin_id)
+
+        def has_live_priority(self) -> bool:
+            return self.config.get("live_priority", False)
+
+        def has_live_content(self) -> bool:
+            return False
+
+        def get_live_modes(self):
+            if self.plugin_manager and hasattr(self.plugin_manager, "plugin_manifests"):
+                manifest = self.plugin_manager.plugin_manifests.get(self.plugin_id, {})
+                return manifest.get("display_modes", [self.plugin_id])
+            return [self.plugin_id]
 
 
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard"
@@ -441,6 +459,31 @@ class TidbytBaseballPlugin(BasePlugin):
         self._derive_settings()
         with self._data_lock:
             self.last_fetch_time = 0
+
+    def has_live_content(self) -> bool:
+        """Framework hook (BasePlugin) for the display controller's
+        live-priority system -- confirmed via the real base_plugin.py
+        source and display_controller.py call sites (not guessed): the
+        controller checks this alongside has_live_priority() (already
+        implemented in BasePlugin, just reads the `live_priority`
+        config toggle below) to decide whether to stay on this plugin
+        instead of rotating to a different one.
+
+        Returns True specifically when a FAVORITE team is live, not
+        just any live game -- matches the existing favorite-priority
+        cascade elsewhere in this plugin (favorite live = exclusive
+        priority), extended to now also apply at the cross-plugin
+        rotation level, not just within this plugin's own display.
+
+        get_live_modes() is NOT overridden -- BasePlugin's default
+        (return all display_modes from the manifest) is already
+        correct here, since this plugin only registers one mode."""
+        with self._data_lock:
+            live_games = list(self.live_games)
+        return any(
+            g.get("away_abbr") in self.favorite_teams or g.get("home_abbr") in self.favorite_teams
+            for g in live_games
+        )
 
     def cleanup(self):
         """Called by the core on plugin unload/disable, if it supports

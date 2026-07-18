@@ -51,6 +51,11 @@
       "default": false,
       "description": "Only relevant when NOTHING is currently live anywhere (not just when no favorite is live) -- as soon as any game goes live, favorite or not, past/upcoming games are always restricted to favorites only regardless of this setting. When nothing is live: controls whether past/upcoming games expand to include all teams (true) or stay scoped to favorite teams only (false, default). Ignored (always favorites-only) when show_favorite_teams_only is on."
     },
+    "live_priority": {
+      "type": "boolean",
+      "default": false,
+      "description": "Read directly by the LEDMatrix framework's own BasePlugin.has_live_priority() -- when true, and a favorite team is currently live (has_live_content()), the display controller stays on THIS plugin instead of rotating to a different plugin, exactly like the football-scoreboard plugin's score-celebration takeover. Distinct from everything else in this file: those settings control what shows WITHIN this plugin; this one controls whether the broader system rotates AWAY from this plugin at all. Off by default since it changes cross-plugin behavior -- opt in deliberately."
+    },
     "show_past_games": {
       "type": "boolean",
       "default": false,

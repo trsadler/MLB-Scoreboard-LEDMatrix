@@ -227,6 +227,42 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## New: hooked into the framework's cross-plugin live-priority system
+
+Distinct from everything else in this plugin: every other setting
+controls what shows WITHIN this plugin. This is the first one that
+controls whether the broader LEDMatrix system rotates AWAY from this
+plugin to a different one at all.
+
+Confirmed the real mechanism directly from the user's own installed
+`base_plugin.py` and `display_controller.py` (not guessed) --
+`has_live_priority()` is already implemented in the framework's
+`BasePlugin`, reading a `live_priority` config key; a plugin overrides
+`has_live_content()` to report whether it currently has something
+live. The controller checks both together and, if true, stays on the
+current plugin instead of advancing rotation -- the same mechanism the
+official football-scoreboard plugin uses for its score-celebration
+takeover.
+
+Implemented `has_live_content()` returning true specifically when a
+FAVORITE team is live (not just any live game), matching this plugin's
+existing favorite-priority cascade. Did not override `get_live_modes()`
+-- the framework's default (all display_modes from the manifest) is
+already correct for a single-mode plugin. Added `live_priority` to the
+config schema, off by default since it's a real change to cross-plugin
+behavior that should be opted into deliberately.
+
+Verified against 7 scenarios including the exact combined condition
+the real display controller checks (`has_live_priority() AND
+has_live_content()`): before any data fetch, favorite live, only a
+non-favorite live, a mix with a favorite among them, a second
+configured favorite team, and both the enabled/disabled states of
+`has_live_priority()` itself. Also updated the sandbox's local
+`BasePlugin` fallback (used only when the real framework isn't
+installed, i.e. only in this dev environment) to mirror the real
+framework's defaults, so these tests reflect actual integration
+behavior rather than a stub that doesn't match reality.
+
 ## Fixed: real regression -- DUE UP stopped triggering during genuine data gaps
 
 Confirmed via a real screenshot: a mid-inning gap showed a floating
