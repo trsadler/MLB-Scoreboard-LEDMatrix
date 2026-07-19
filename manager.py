@@ -1730,6 +1730,38 @@ class TidbytBaseballPlugin(BasePlugin):
 
             return True
 
+        def extract_inning_transition(status_type_dict, current_period):
+            """Detects the "mid-inning" (between top and bottom of the
+            SAME inning) and "end-of-inning" (between bottom of one
+            inning and top of the next) states, per explicit request --
+            reuses the same confirmed-real status_type.detail/
+            shortDetail text fields already used for inning_half's
+            fallback, since ESPN's own broadcast-style phrasing
+            ("Mid 4th", "End of the 7th") is the natural place to find
+            this rather than guessing at another structured field name.
+
+            For "end" specifically, tries to parse the actual inning
+            number directly out of the text (e.g. the "7" in "End of
+            the 7th") rather than trusting status.period, since period
+            may or may not have already incremented to the new inning
+            by the time this state shows -- sidesteps that timing
+            ambiguity entirely. Falls back to period if no number is
+            found in the text.
+
+            Returns (state, inning_number) where state is "mid", "end",
+            or None (normal, no transition)."""
+            status_text = " ".join(
+                str(status_type_dict.get(k, "")) for k in ("detail", "shortDetail")
+            ).lower()
+            if "mid" in status_text:
+                return ("mid", current_period)
+            if "end" in status_text:
+                match = re.search(r"(\d+)", status_text)
+                if match:
+                    return ("end", int(match.group(1)))
+                return ("end", max(current_period - 1, 1))
+            return (None, current_period)
+
         def extract_team_record(competitor):
             """UNCONFIRMED against real captured data (couldn't verify
             the exact sub-field names -- ESPN's public API shut down
@@ -1816,6 +1848,9 @@ class TidbytBaseballPlugin(BasePlugin):
         pitch_count = extract_pitch_count(situation)
         last_play_id, last_play_text, last_play_type = extract_last_play(situation)
         game_date_str, game_time_str = self._format_game_datetime(event)
+        inning_transition_state, inning_transition_number = extract_inning_transition(
+            status_type, status.get("period", 1)
+        )
         away_linescores = extract_linescores(away)
         home_linescores = extract_linescores(home)
         away_hits, away_errors = extract_hits_errors(away)
@@ -1865,6 +1900,8 @@ class TidbytBaseballPlugin(BasePlugin):
             "home_logo": None,
             "inning": status.get("period", 1),
             "inning_half": extract_inning_half(situation, status_type),
+            "inning_transition_state": inning_transition_state,
+            "inning_transition_number": inning_transition_number,
             "balls": situation.get("balls", 0),
             "strikes": situation.get("strikes", 0),
             "outs": situation.get("outs", 0),
@@ -2232,7 +2269,19 @@ class TidbytBaseballPlugin(BasePlugin):
                 inning_tri_size = 6
                 sample_bbox = self._measure(self.font_tiny, "12")  # worst-case 2-digit inning
                 inning_number_w = sample_bbox[2] - sample_bbox[0]
-                inning_reserved_w = inning_tri_size + 3 + inning_number_w + 2
+                if game.get("inning_transition_state") in ("mid", "end"):
+                    # "MID 12" / "END 12" (worst case) measured at 24-25px,
+                    # vs 19px for the normal triangle+number -- widen the
+                    # reservation specifically during this state so the
+                    # label doesn't overlap the diamond. Brief/occasional
+                    # state, so temporarily taking a bit more space here
+                    # (shrinking the diamond correspondingly, which
+                    # already has a safe minimum width) is an acceptable
+                    # trade-off.
+                    sample_label = self._measure(self.font_tiny, "END 12")
+                    inning_reserved_w = (sample_label[2] - sample_label[0]) + 2
+                else:
+                    inning_reserved_w = inning_tri_size + 3 + inning_number_w + 2
 
                 outs_size = 4
                 outs_reserved_w = outs_size + 2 + 3
@@ -2824,7 +2873,22 @@ class TidbytBaseballPlugin(BasePlugin):
 
         Drawn with a HARD edge (no anti-aliasing): at only 6px tall,
         supersampling + downsampling was producing a soft/blobby shape
-        that read as "not really a triangle" rather than a clean one."""
+        that read as "not really a triangle" rather than a clean one.
+
+        During the MID/END transition states (see extract_inning_
+        transition), replaces the triangle+number entirely with "MID N"
+        / "END N" text, matching ESPN's own broadcast-style phrasing
+        for these moments per explicit request."""
+        state = game.get("inning_transition_state")
+        if state in ("mid", "end"):
+            label = f"{state.upper()} {game.get('inning_transition_number', game['inning'])}"
+            bbox = self._measure(self.font_tiny, label)
+            glyph_h = bbox[3] - bbox[1]
+            tri_size = 6
+            text_y = y + tri_size // 2 - glyph_h // 2 - bbox[1]
+            self._render_text(image, (x, text_y), label, self.font_tiny, (255, 255, 255))
+            return
+
         tri_size = 6
         draw = ImageDraw.Draw(image)
         if game["inning_half"]:

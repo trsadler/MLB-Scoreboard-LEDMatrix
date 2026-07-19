@@ -227,6 +227,37 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## New: "MID"/"END" inning indicator during between-innings transitions
+
+Per explicit request: during the moment between top and bottom of the
+same inning, the indicator now shows "MID N" instead of the triangle;
+during the moment between the bottom of one inning and the top of the
+next, it shows "END N" (the inning that just ended).
+
+Reused the same confirmed-real status text fields already used for the
+inning_half text fallback -- ESPN's own broadcast-style phrasing
+("Mid 4th", "End of the 6th") is the natural signal for this rather
+than guessing at another structured field. For "END" specifically,
+parses the actual inning number directly out of the text rather than
+trusting `status.period`, since period may or may not have already
+incremented to the new inning by the time this state shows --
+sidesteps that timing ambiguity entirely.
+
+Widened the reserved layout space specifically during this state
+("END 12" worst-case measures ~25px vs. 19px for the normal
+triangle+number), shrinking the diamond correspondingly for that brief
+window -- it already has a safe minimum width, so this degrades
+gracefully.
+
+Tested 6 extraction scenarios (mid/end in both detail and shortDetail
+fields, the end-of-inning number-parsing specifically, and two normal
+non-transition cases to confirm no false positives) plus full pipeline
+rendering for both mid and end states -- confirmed via pixel
+measurement that actual text renders (30-32px wide) rather than the
+narrow 6px triangle, with no collision against the diamond. Re-verified
+the normal (non-transition) triangle rendering is completely
+unaffected.
+
 ## Fixed: DUE UP showed the wrong team right at a half-inning transition
 
 Real reported bug: right after the 3rd out, "DUE UP" briefly showed
