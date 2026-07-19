@@ -227,6 +227,40 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: inning arrow always pointed up, even in the bottom of an inning
+
+Real reported bug, root cause found by inspection: `inning_half` was
+read via `situation.get("isTopInning", True)` -- a field name that,
+unlike almost everything else in this plugin, was never actually
+confirmed against real ESPN data. If "isTopInning" isn't the real key
+name, this silently falls through to the default (True) on every
+single call, regardless of actual game state -- exactly matching
+"always shows top, even in the bottom of an inning."
+
+Fixed the same way the home-run detection bug was fixed: instead of
+betting on one guessed field name, tries a couple of plausible
+variants first, then falls back to parsing the human-readable status
+text (`status.type.detail`/`shortDetail`, confirmed real and populated
+from earlier work in this plugin) for "top"/"bot" as a much more
+reliable signal. Only defaults to top as an absolute last resort if
+none of these signals are present.
+
+Tested 6 scenarios: the field present directly as both True and False,
+the field missing entirely with the status text saying "Bottom 7th",
+the field missing with shortDetail saying "Bot 7th", the field missing
+with text saying "Top 4th", and nothing available at all (safe
+default) -- all correct. Verified the full pipeline end-to-end too, not
+just the extraction: rendered with `inning_half=False` and confirmed
+via pixel measurement that the triangle's shape actually narrows
+downward now (genuinely pointing down), not just that the boolean
+value changed.
+
+Also shared a diagnostic script (`dump_inning_half.py`) to confirm the
+real field name against live data whenever there's a game in progress
+-- the text-based fallback should work regardless, but real
+confirmation would let this be tightened to use the structured field
+directly instead of relying on text parsing.
+
 ## New: hooked into the framework's cross-plugin live-priority system
 
 Distinct from everything else in this plugin: every other setting

@@ -1685,6 +1685,41 @@ class TidbytBaseballPlugin(BasePlugin):
                     continue
             return None, None
 
+        def extract_inning_half(situation_dict, status_type_dict):
+            """Root cause of a real reported bug -- confirmed by
+            inspection, not yet against live data: the previous version
+            used `situation.get("isTopInning", True)`, a field name that
+            was NEVER actually confirmed against real ESPN data (unlike
+            most other fields in this plugin). If "isTopInning" isn't
+            the real key, this ALWAYS silently falls through to the
+            default (True), which exactly matches the reported symptom
+            of the inning arrow always pointing up regardless of actual
+            game state.
+
+            Fixed the same way the home-run detection bug was fixed:
+            don't rely on a single guessed structured field. Tries a
+            couple of plausible field-name variants first, then falls
+            back to parsing the human-readable status text (confirmed
+            real and populated from earlier work in this plugin --
+            status.type.detail/shortDetail commonly reads something
+            like "Top 4th" or "Bot 7th") for "top"/"bot" as a much more
+            reliable signal. Only defaults to True (top) as an absolute
+            last resort if none of these signals are present at all."""
+            for key in ("isTopInning", "topInning", "isTopHalf"):
+                val = situation_dict.get(key)
+                if val is not None:
+                    return bool(val)
+
+            status_text = " ".join(
+                str(status_type_dict.get(k, "")) for k in ("detail", "shortDetail")
+            ).lower()
+            if "bot" in status_text:
+                return False
+            if "top" in status_text:
+                return True
+
+            return True
+
         def extract_team_record(competitor):
             """UNCONFIRMED against real captured data (couldn't verify
             the exact sub-field names -- ESPN's public API shut down
@@ -1819,7 +1854,7 @@ class TidbytBaseballPlugin(BasePlugin):
             "away_logo": None,
             "home_logo": None,
             "inning": status.get("period", 1),
-            "inning_half": situation.get("isTopInning", True),
+            "inning_half": extract_inning_half(situation, status_type),
             "balls": situation.get("balls", 0),
             "strikes": situation.get("strikes", 0),
             "outs": situation.get("outs", 0),
