@@ -2193,7 +2193,26 @@ class TidbytBaseballPlugin(BasePlugin):
                     # Mid-inning gap in ESPN's data (between at-bats, after
                     # a play, etc.) -- show who's due up next instead of
                     # leaving this row blank.
-                    batting_team = game["away_abbr"] if game["inning_half"] else game["home_abbr"]
+                    #
+                    # Real reported bug: right after the 3rd out, DUE UP
+                    # briefly showed the team that just finished batting,
+                    # not the team coming up next. Likely cause: ESPN's
+                    # situation data can have a brief window right at a
+                    # half-inning transition where `outs` still shows 3
+                    # (the just-completed half's final count, not yet
+                    # reset to 0) while whatever determines inning_half
+                    # hasn't flipped yet either -- meaning the data at
+                    # that exact moment still describes the OLD half, not
+                    # the new one. outs==3 specifically only makes sense
+                    # as "the half that JUST ended", since a genuinely
+                    # new half-inning starts at 0 outs -- so treat it as
+                    # a signal to invert which team is picked here.
+                    # Reasoned from the mechanics of the data, not yet
+                    # confirmed against a captured real example of this
+                    # exact transition window.
+                    stale_half_inning = game.get("outs") == 3
+                    is_top = game["inning_half"] if not stale_half_inning else not game["inning_half"]
+                    batting_team = game["away_abbr"] if is_top else game["home_abbr"]
                     self._draw_due_up(image, draw, right_x0 + 1, top_margin, right_w - 2, batting_team)
                 else:
                     self._draw_pitch_info(

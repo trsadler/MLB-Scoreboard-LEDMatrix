@@ -227,6 +227,29 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: DUE UP showed the wrong team right at a half-inning transition
+
+Real reported bug: right after the 3rd out, "DUE UP" briefly showed
+the team that just finished batting, not the team actually coming up
+next.
+
+Reasoned root cause (not yet confirmed against a captured real example
+of this exact transition window, since it only lasts a moment): ESPN's
+situation data likely has a brief window right at a half-inning
+transition where `outs` still shows 3 (the just-completed half's final
+count) while whatever determines inning_half hasn't flipped yet either
+-- meaning the data at that exact instant still describes the OLD
+half, not the new one. `outs == 3` only makes sense as "the half that
+just ended," since a genuinely new half-inning always starts at 0 outs
+-- so that's a usable signal to invert which team gets picked.
+
+Tested 4 scenarios: the exact reported case (stale top-half data with
+outs=3, correctly flips to the home team), two normal mid-inning gaps
+at both halves that should be completely unaffected (outs=1 and
+outs=2, neither near a transition), and the transition in the other
+direction too (bottom half ending, correctly flips to away for the
+next inning's top half). All correct.
+
 ## Fixed: an unrelated favorite's upcoming/past game could interrupt a live one
 
 Real community report: with two favorites configured, one team's
