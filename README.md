@@ -227,6 +227,31 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: an unrelated favorite's upcoming/past game could interrupt a live one
+
+Real community report: with two favorites configured, one team's
+upcoming game kept cycling into rotation while a DIFFERENT favorite
+was live. Root cause: the favorite-live branch scoped past/upcoming to
+*any* configured favorite team, not specifically the team that was
+actually live.
+
+Fixed by scoping to only the team(s) currently live -- if DET is live
+and PHI (also a favorite) has an unrelated upcoming game, PHI's stays
+excluded; DET's own past/upcoming still shows alongside its live game,
+same as before.
+
+**Also added `live_game_exclusive`** (off by default) for people who
+want zero interruption at all, not even from the live team's own
+schedule -- when on, a live favorite shows completely alone.
+
+Tested both behaviors against the exact reported scenario (DET live,
+PHI has an unrelated upcoming game) and a doubleheader-style case
+(DET live AND has its own earlier final today, PHI still has an
+unrelated upcoming game) to properly distinguish the two settings:
+default correctly shows DET live + DET's own final, excluding PHI
+entirely; exclusive mode correctly shows only the live game, excluding
+even DET's own final.
+
 ## Fixed: inning arrow always pointed up, even in the bottom of an inning
 
 Real reported bug, root cause found by inspection: `inning_half` was

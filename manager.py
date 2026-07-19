@@ -422,6 +422,7 @@ class TidbytBaseballPlugin(BasePlugin):
         self.live_update_interval = cfg.get("live_update_interval_seconds", 15)
         self.game_rotation_seconds = cfg.get("game_rotation_seconds", 8)
         self.show_favorite_teams_only = cfg.get("show_favorite_teams_only", False)
+        self.live_game_exclusive = cfg.get("live_game_exclusive", False)
         self.display_duration = cfg.get("display_duration", 20)
         self.away_color_fallback = tuple(cfg.get("away_color", DEFAULT_AWAY_COLOR))
         self.home_color_fallback = tuple(cfg.get("home_color", DEFAULT_HOME_COLOR))
@@ -900,22 +901,31 @@ class TidbytBaseballPlugin(BasePlugin):
             favorite_live_games = [g for g in live_games if _is_favorite_game(g)]
 
             if favorite_live_games:
-                # Live favorite game(s) still get priority (listed
-                # first, so they're what shows first each time rotation
-                # cycles back around), but past/upcoming toggles are
-                # still honored here too -- previously this branch
-                # suppressed past/upcoming entirely whenever a favorite
-                # was live, even for the SAME favorite team. Scoped
-                # strictly to favorite teams regardless of
-                # past_upcoming_all_teams -- mixing in some OTHER team's
-                # past/upcoming game here would defeat the point of
-                # favorite-team prioritization.
                 rotation_games = list(favorite_live_games)
-                if self.show_past_games:
-                    rotation_games += [g for g in past_games if _is_favorite_game(g)]
-                if self.show_upcoming_games:
-                    rotation_games += [g for g in upcoming_games if _is_favorite_game(g)]
-                cascade_state = "favorite team(s) live -- showing that + favorites' past/upcoming"
+                if self.live_game_exclusive:
+                    # Opt-in: nothing but the live game(s) at all, not
+                    # even the live team's own past/upcoming.
+                    cascade_state = "favorite team(s) live, live_game_exclusive on -- showing ONLY that"
+                else:
+                    # Reported issue: this used to scope past/upcoming to
+                    # ANY configured favorite, so an unrelated favorite's
+                    # upcoming game could interrupt a DIFFERENT favorite's
+                    # live game. Now scoped to only the team(s) actually
+                    # live right now.
+                    live_team_abbrs = set()
+                    for g in favorite_live_games:
+                        for abbr in (g["away_abbr"], g["home_abbr"]):
+                            if abbr in self.favorite_teams:
+                                live_team_abbrs.add(abbr)
+
+                    def _is_currently_live_favorite(g):
+                        return g["away_abbr"] in live_team_abbrs or g["home_abbr"] in live_team_abbrs
+
+                    if self.show_past_games:
+                        rotation_games += [g for g in past_games if _is_currently_live_favorite(g)]
+                    if self.show_upcoming_games:
+                        rotation_games += [g for g in upcoming_games if _is_currently_live_favorite(g)]
+                    cascade_state = "favorite team(s) live -- showing that + ONLY that team's past/upcoming"
             elif self.show_favorite_teams_only:
                 rotation_games = []
                 if self.show_past_games:

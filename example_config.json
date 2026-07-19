@@ -9,6 +9,7 @@
     "update_interval_seconds": 300,
     "live_update_interval_seconds": 15,
     "show_favorite_teams_only": false,
+    "live_game_exclusive": false,
     "past_upcoming_all_teams": false,
     "live_priority": false,
     "show_past_games": false,

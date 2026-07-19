@@ -46,6 +46,11 @@
       "default": false,
       "description": "STRICT mode: never show any other team's games at all (live, past, or upcoming) -- always favorites only. When off (default), favorites still take priority whenever they have a live game, but other teams' live games and past/upcoming games can fill the rotation when no favorite is currently playing."
     },
+    "live_game_exclusive": {
+      "type": "boolean",
+      "default": false,
+      "description": "When a favorite team is live, show ONLY that live game -- no past/upcoming games at all, not even that same team's own. Off by default: normally, a live favorite's own past/upcoming games still show alongside it (but a DIFFERENT favorite's past/upcoming stays excluded while any favorite is live, regardless of this setting)."
+    },
     "past_upcoming_all_teams": {
       "type": "boolean",
       "default": false,
