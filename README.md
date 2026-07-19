@@ -227,6 +227,25 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Improved: DUE UP now uses the MID/END signal as its primary source
+
+Follow-up after the previous fix still occasionally showed the wrong
+team: the MID/END transition state (just added, above) directly and
+unambiguously identifies which half is coming next -- "Mid" means the
+top half just ended (home bats next), "End" means the bottom half just
+ended (away bats next, top of the new inning). That's a more reliable
+signal than the outs==3 heuristic, since it comes straight from ESPN's
+own explicit broadcast-style text rather than an inference about data
+timing.
+
+Restructured DUE-UP team selection to check this first, falling back
+to the outs==3 heuristic only when there's no MID/END signal at all
+(e.g. a data gap mid-at-bat, unrelated to a half-inning change).
+Tested 5 scenarios: MID state, END state, and the three fallback cases
+from before (stale outs==3, and two normal non-transition gaps) --
+all correct. Verified the full rendering pipeline too, not just the
+selection logic in isolation.
+
 ## New: "MID"/"END" inning indicator during between-innings transitions
 
 Per explicit request: during the moment between top and bottom of the
