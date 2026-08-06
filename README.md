@@ -227,6 +227,28 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Follow-up: User-Agent alone wasn't enough, still getting HTTP 403
+
+Confirmed via a real log line, not a guess: the standard browser
+User-Agent fix above was deployed and STILL got HTTP 403 from ESPN.
+That rules out "just needed a normal-looking UA string" as the fix --
+points at a bot-detection system checking for the broader set of
+headers a real browser always sends alongside User-Agent, not that
+value in isolation.
+
+Expanded to a fuller, realistic browser header set: Accept,
+Accept-Language, Accept-Encoding, Referer (pointing at ESPN's own
+scoreboard page, matching what a browser would actually send when
+visiting it), Origin, Connection, and the three Sec-Fetch-* headers
+Chrome adds automatically to same-site requests.
+
+Could not verify this against a live request from this environment
+(no outbound network access here) -- if this ALSO doesn't resolve it,
+that would point toward something no header change can fix (IP-based
+rate limiting, TLS fingerprinting, or a more fundamental block on
+non-browser traffic to this endpoint), which would need a genuinely
+different approach. Needs confirmation against the real deployment.
+
 ## Fixed: real breakage -- ESPN started rejecting the plugin's User-Agent
 
 Real report (via Chuck): ESPN started rejecting certain User-Agent

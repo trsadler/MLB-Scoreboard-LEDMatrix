@@ -259,20 +259,39 @@ class TidbytBaseballPlugin(BasePlugin):
         self.session = requests.Session()
         # Changed from a custom "LEDMatrix-TidbytBaseball/1.0" string,
         # per a real report (via Chuck) that ESPN started rejecting
-        # certain User-Agent headers around 8/4 -- that custom string is
-        # exactly the kind of easily-flagged non-browser identifier a
-        # bot-detection change would target, and the symptom (universal
-        # "No Game", meaning every single request was failing, not just
-        # some specific data-parsing edge case) is consistent with a
-        # wholesale request-level rejection rather than a response-shape
-        # change. Using a standard browser UA is a well-known, safe
-        # workaround for this class of issue regardless of the exact
-        # cause.
+        # certain User-Agent headers around 8/4.
+        #
+        # CONFIRMED via a real, live 403 (not a guess): switching to a
+        # standard browser User-Agent ALONE was not sufficient -- still
+        # got HTTP 403 with a completely normal Chrome UA string. This
+        # points at something beyond just the User-Agent value itself --
+        # a common bot-detection pattern is checking for the ABSENCE of
+        # the other headers a real browser always sends alongside it
+        # (Accept, Accept-Language, Referer, etc.), not just User-Agent
+        # in isolation. Expanded to a fuller, more realistic browser
+        # header set for that reason.
+        #
+        # Could not verify this expanded set against a live request
+        # myself (no outbound network access in the environment used for
+        # this work) -- if this ALSO doesn't resolve it, that would point
+        # toward something header-independent (IP-based rate limiting,
+        # TLS fingerprinting, or ESPN blocking this endpoint for
+        # non-browser traffic more fundamentally), which no header
+        # change could fix and would need a different approach entirely.
         self.session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            )
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://www.espn.com/mlb/scoreboard",
+            "Origin": "https://www.espn.com",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
         })
 
         self.live_games: List[Dict[str, Any]] = []
