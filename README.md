@@ -227,6 +227,58 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: team abbreviation centering had a systematic 0.5px left bias
+
+Real report: the right-side abbreviation looked off-center, needing a
+1px shift right. Measured precisely and found the actual mechanism:
+floor-division in the centering math ("(w-ink_w)//2") has a systematic
+0.5px left bias whenever the leftover space is odd -- and confirmed
+this affects BOTH sides equally (away measured the identical 0.5px
+left lean in the same test), not something specific to the right --
+it's just more or less visible per matchup depending on whether that
+specific abbreviation's ink width happens to land on an odd or even
+remainder.
+
+Same carefulness as the logo fix: this shared formula also drives
+9-inning's text, which is explicitly off-limits. Added another opt-in
+parameter (round_half_up_centering) defaulting to the exact original
+floor behavior, enabled only for the 10/11-inning path.
+
+Verified precisely: before the fix, both away and home measured 0.5px
+left of true center; after, both measure 0.5px right -- exactly the
+requested 1px shift. Re-confirmed 9-inning's measured center is
+byte-for-byte identical to its pre-fix value (11.0, still 0.5px left
+of the 11.5 true center) -- genuinely untouched, not just visually
+similar.
+
+## Fixed: 11-inning logo bleeding into the abbreviation bar, made smaller
+
+Real report: the away logo bleeding into the team abbreviation box.
+Confirmed the mechanism precisely: the abbreviation bar reserves ~9px
+at the bottom of the column, leaving only ~23px of clean space above
+it, but the logo was centered against the FULL 32px column height --
+pushing its centered position low enough that its bottom edge got
+overwritten/cropped by the bar, regardless of the logo's own size.
+
+Fixed the actual centering logic (not just shrinking the logo to
+compensate for a positioning bug), but had to do it carefully: the
+same math showed the 9-inning view has this identical underlying
+overlap too (7px, currently just never reported/an issue there) --
+changing the shared centering formula outright would have altered the
+9-inning render, which is explicitly off-limits. Added an opt-in
+parameter (`logo_avoids_bar`) defaulting to the exact original
+behavior, and only enabled it for the 10/11-inning code path they
+share, leaving 9-inning completely untouched.
+
+Verified via direct computation (not pixel-measuring a placeholder
+logo shape, which turned out to be misleading due to its own inset
+circle geometry): confirmed 9-inning's computed logo_y exactly matches
+the original pre-fix formula (both compute to 2), and confirmed both
+10 and 11-inning now compute to zero overlap with the bar. Also
+reduced the 11-inning logo size (26px -> 20px) per the explicit
+"slightly smaller" request, comfortably within the 23px available
+space with margin to spare.
+
 ## Follow-up: User-Agent alone wasn't enough, still getting HTTP 403
 
 Confirmed via a real log line, not a guess: the standard browser

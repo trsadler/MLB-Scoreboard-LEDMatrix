@@ -2072,11 +2072,21 @@ class TidbytBaseballPlugin(BasePlugin):
                     cap_h = height // 2
                     bleed = 4
                 elif num_innings_check == 11:
-                    # Per explicit request: enlarge logos a bit here --
-                    # more bleed allowance than the standard 4px.
+                    # Per follow-up correction: the logo was bleeding
+                    # into the abbreviation bar -- confirmed via direct
+                    # measurement that the bar reserves ~9px at the
+                    # bottom of the column, leaving only ~23px of clean
+                    # space above it for the logo, not the full 32px
+                    # column height. The previous size (26px) exceeded
+                    # that available space by 3px, so its bottom edge
+                    # was getting overwritten by the bar. cap_h now
+                    # reflects that real constraint (with a couple px of
+                    # margin, not just barely fitting), and bleed is
+                    # reduced for a smaller size overall per explicit
+                    # request.
                     col_w = left_w_check // 2
-                    cap_h = height
-                    bleed = 12
+                    cap_h = 21
+                    bleed = 6
                 else:
                     col_w = left_w_check // 2
                     cap_h = height
@@ -2550,12 +2560,16 @@ class TidbytBaseballPlugin(BasePlugin):
                                     game["away_abbr"], game["away_score"], game.get("away_logo"),
                                     away_txt_color, game["away_color"], shared_font,
                                     bar_color_override=yellow if away_won else None,
-                                    show_score=not is_extra_innings)
+                                    show_score=not is_extra_innings,
+                                    logo_avoids_bar=is_extra_innings,
+                                    round_half_up_centering=is_extra_innings)
             self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
                                     game["home_abbr"], game["home_score"], game.get("home_logo"),
                                     home_txt_color, game["home_color"], shared_font,
                                     bar_color_override=yellow if home_won else None,
-                                    show_score=not is_extra_innings)
+                                    show_score=not is_extra_innings,
+                                    logo_avoids_bar=is_extra_innings,
+                                    round_half_up_centering=is_extra_innings)
 
         # No separate gray separator bar here anymore -- the box score's
         # own grid-divider system already draws a line at its own left
@@ -2969,7 +2983,8 @@ class TidbytBaseballPlugin(BasePlugin):
 
 
     def _draw_team_column(self, image, draw, x0, y0, w, h, abbr, score, logo, text_color, bg_color, font,
-                          bar_color_override=None, show_score=True):
+                          bar_color_override=None, show_score=True, logo_avoids_bar=False,
+                          round_half_up_centering=False):
         """Logo fills nearly the whole column (as large as the panel
         allows); a darkened bar across the bottom holds the bold
         'ABBR SCORE' text so it stays legible over the logo. `font` is
@@ -2979,7 +2994,17 @@ class TidbytBaseballPlugin(BasePlugin):
         `bar_color_override`: used for final (completed) games to
         highlight the winning team's bar in yellow instead of its
         normal team color. `show_score`: set False for upcoming games,
-        which don't have a score yet -- shows just the abbreviation."""
+        which don't have a score yet -- shows just the abbreviation.
+
+        `logo_avoids_bar`: default False preserves the original
+        full-height centering used everywhere this was already called
+        (explicitly required to leave the 9-inning final view
+        untouched, even though it technically has the same underlying
+        overlap -- just never reported as an issue there). Set True to
+        center the logo within the space actually available BEFORE the
+        bar starts instead -- fixes a real reported case (11-inning
+        final view) where centering on the full height let the logo
+        visibly bleed into/get cropped by the bar."""
         text_line = f"{abbr} {score}" if show_score else abbr
         line_bbox = self._measure(font, text_line)
         line_h = line_bbox[3] - line_bbox[1]
@@ -2987,11 +3012,12 @@ class TidbytBaseballPlugin(BasePlugin):
 
         if logo is not None:
             # No max(...,0) clamp: when the logo is bigger than the
-            # column (allowed to bleed off the edges per request), this
-            # keeps it centered with a symmetric negative offset instead
-            # of snapping to the left/top edge.
+            # available space (allowed to bleed off the edges per
+            # request), this keeps it centered with a symmetric negative
+            # offset instead of snapping to the top edge.
+            logo_area_h = (h - bar_h) if logo_avoids_bar else h
             logo_x = x0 + (w - logo.width) // 2
-            logo_y = y0 + (h - logo.height) // 2
+            logo_y = y0 + (logo_area_h - logo.height) // 2
             image.paste(logo, (logo_x, logo_y), logo)
 
         bar_y0 = y0 + h - bar_h
@@ -3004,9 +3030,24 @@ class TidbytBaseballPlugin(BasePlugin):
         # wasn't centered under the logo. Logo is centered against the
         # same column width w, so aligning ink to that same center
         # keeps both genuinely aligned.
+        #
+        # round_half_up_centering: floor-division in "(w-ink_w)//2"
+        # has a systematic 0.5px left bias whenever (w-ink_w) is odd --
+        # confirmed via direct measurement (both away AND home showed
+        # the identical 0.5px left lean from true center in a test
+        # case), so it's not specific to either side -- just more or
+        # less visible depending on the specific abbreviation's ink
+        # width parity for a given matchup. Defaults to False
+        # (preserves the exact original floor behavior) since the same
+        # bias exists in the 9-inning view too, which is explicitly
+        # off-limits -- only enabled where reported (10/11-inning, same
+        # condition as logo_avoids_bar above).
         ink_left, ink_right = self._ink_extent(font, text_line)
         ink_w = ink_right - ink_left + 1
-        target_ink_x0 = x0 + max((w - ink_w) // 2, 0)
+        if round_half_up_centering:
+            target_ink_x0 = x0 + max((w - ink_w + 1) // 2, 0)
+        else:
+            target_ink_x0 = x0 + max((w - ink_w) // 2, 0)
         tx = target_ink_x0 - ink_left + 3  # +3 undoes _ink_extent's internal scratch-render offset
         ty = bar_y0 + max((bar_h - line_h) // 2, 0) - line_bbox[1]
         self._render_text(image, (tx, ty), text_line, font, text_color)
