@@ -257,7 +257,23 @@ class TidbytBaseballPlugin(BasePlugin):
         self._derive_settings()
 
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "LEDMatrix-TidbytBaseball/1.0"})
+        # Changed from a custom "LEDMatrix-TidbytBaseball/1.0" string,
+        # per a real report (via Chuck) that ESPN started rejecting
+        # certain User-Agent headers around 8/4 -- that custom string is
+        # exactly the kind of easily-flagged non-browser identifier a
+        # bot-detection change would target, and the symptom (universal
+        # "No Game", meaning every single request was failing, not just
+        # some specific data-parsing edge case) is consistent with a
+        # wholesale request-level rejection rather than a response-shape
+        # change. Using a standard browser UA is a well-known, safe
+        # workaround for this class of issue regardless of the exact
+        # cause.
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+        })
 
         self.live_games: List[Dict[str, Any]] = []
         self.past_games: List[Dict[str, Any]] = []
@@ -811,6 +827,23 @@ class TidbytBaseballPlugin(BasePlugin):
 
         try:
             resp = self.session.get(ESPN_SCOREBOARD_URL, timeout=10)
+            if resp.status_code in (401, 403):
+                # Specific, actionable log for exactly this class of
+                # failure -- a real instance of this (ESPN rejecting a
+                # custom User-Agent header around 8/4) previously showed
+                # up only as a generic "No Game" display with no clear
+                # cause in the logs, and was only diagnosed via an
+                # external tip rather than the logs themselves. Calling
+                # out the status code and current header explicitly here
+                # means a similar issue is self-diagnosable next time.
+                self.logger.error(
+                    f"ESPN scoreboard fetch got HTTP {resp.status_code} -- likely being "
+                    f"blocked/rate-limited at the request level (e.g. a rejected User-Agent "
+                    f"header), not a data problem. Current User-Agent: "
+                    f"{self.session.headers.get('User-Agent')!r}. If this persists, try a "
+                    f"different/more standard browser User-Agent string."
+                )
+                return
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -1994,9 +2027,41 @@ class TidbytBaseballPlugin(BasePlugin):
             # they need their own column-width calculation here too,
             # rather than sharing live's 50/50 assumption.
             if game.get("game_type") == "final":
-                col_w = int(width * 0.4) // 2
-                cap_h = height
-                bleed = 4
+                # Must match _render_final_game's left_w exactly -- these
+                # two spots getting out of sync is exactly what caused
+                # logo bleed into the box score once before. left_w is
+                # now fully dynamic per exact inning count (not just a
+                # binary "extra innings or not" split), since fixing
+                # every column at its exact minimal padding meant a fixed
+                # left_w left visible unused space for any game with
+                # fewer wide (10-12) columns than the 12-inning case it
+                # was sized for.
+                away_ls_check = game.get("away_linescores") or []
+                home_ls_check = game.get("home_linescores") or []
+                num_innings_check = min(max(9, len(away_ls_check), len(home_ls_check)), 12)
+                narrow_check = min(num_innings_check, 9)
+                wide_check = max(num_innings_check - 9, 0)
+                box_score_w_check = 6 * narrow_check + 10 * wide_check + (10 + 10 + 6)
+                left_w_check = width - box_score_w_check
+                if num_innings_check == 12:
+                    # Per explicit request: 12-inning view stacks the
+                    # team boxes vertically instead of side by side (see
+                    # _render_final_game), so each logo gets the FULL
+                    # left_w width but only half the panel height, not
+                    # half the width like the side-by-side views.
+                    col_w = left_w_check
+                    cap_h = height // 2
+                    bleed = 4
+                elif num_innings_check == 11:
+                    # Per explicit request: enlarge logos a bit here --
+                    # more bleed allowance than the standard 4px.
+                    col_w = left_w_check // 2
+                    cap_h = height
+                    bleed = 12
+                else:
+                    col_w = left_w_check // 2
+                    cap_h = height
+                    bleed = 4
             elif game.get("game_type") == "upcoming":
                 col_w = 41
                 # Logos only have the area ABOVE the bottom bar to fit
@@ -2366,46 +2431,121 @@ class TidbytBaseballPlugin(BasePlugin):
         _enrich_boxscore_stats if missing, and simply left blank
         (rather than showing a misleading 0) if that still doesn't
         find them."""
-        left_w = int(width * 0.4)  # squeezed from 50% to give the box score grid more room
+        # Determine the actual inning count FIRST (capped at 12, the
+        # established hard limit), then compute the box score's EXACT
+        # width need for that many innings, and derive left_w as
+        # whatever's left over. This is the real fix for the "leftover
+        # green space" problem: fixed per-column widths (correct, per
+        # explicit spec) combined with a FIXED left_w inevitably left a
+        # gap whenever a game had fewer wide (10-12) columns than the
+        # 12-inning case the old fixed left_w was sized for. Deriving
+        # left_w dynamically per-game means the box score always gets
+        # exactly what it needs -- no more, no less -- and any width
+        # "saved" by not needing extra wide columns goes back to the
+        # team columns/logos instead of sitting empty.
+        away_ls_raw = game.get("away_linescores") or []
+        home_ls_raw = game.get("home_linescores") or []
+        num_innings = min(max(9, len(away_ls_raw), len(home_ls_raw)), 12)
+        is_extra_innings = num_innings > 9
+
+        # 6/10 (not 5/9): includes the +1 DIVIDER_W allowance -- each
+        # cell's grid-divider line is drawn at its own left edge, which
+        # would otherwise silently consume what should be a genuine
+        # empty 1px padding pixel. See the matching comment further down
+        # by the column-width constants for the full explanation.
+        single_digit_w, double_digit_w = 6, 10  # 1px padding each side of 1 or 2 digits, plus divider
+        rhe_w = double_digit_w * 2 + single_digit_w  # R, H (2-digit) + E (always 1-digit)
+        num_narrow_innings = min(num_innings, 9)
+        num_wide_innings = max(num_innings - 9, 0)
+        box_score_w = (
+            single_digit_w * num_narrow_innings + double_digit_w * num_wide_innings + rhe_w
+        )
+        left_w = width - box_score_w
         col_w = left_w // 2
 
-        draw.rectangle([0, 0, col_w - 1, height - 1], fill=self._darken_color(game["away_color"]))
-        draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=self._darken_color(game["home_color"]))
+        if num_innings == 12:
+            # Per explicit request: not enough room to make the normal
+            # side-by-side team columns work at this extreme case, so
+            # this view is reconstructed entirely -- team boxes stack
+            # vertically (away on top, home on bottom) instead of side
+            # by side, each spanning the FULL left_w width but only half
+            # the panel height. Abbreviation text is dropped entirely
+            # (the box score's own header area doesn't have a natural
+            # place to show it either, and there simply isn't room left
+            # for a text bar at this width) -- just team color + logo,
+            # letting the logo itself (plus the box score's own R column
+            # for identifying scores) carry the identification.
+            half_h = height // 2
+            yellow = (255, 200, 0)
+            away_won = game["away_score"] > game["home_score"]
+            home_won = game["home_score"] > game["away_score"]
 
-        away_text = f"{game['away_abbr']} {game['away_score']}"
-        home_text = f"{game['home_abbr']} {game['home_score']}"
-        available_text_width = col_w - 4
-        shared_font = self._fit_font_for_pair(draw, away_text, home_text, available_text_width, start_size=10)
+            draw.rectangle([0, 0, left_w - 1, half_h - 1], fill=self._darken_color(game["away_color"]))
+            draw.rectangle([0, half_h, left_w - 1, height - 1], fill=self._darken_color(game["home_color"]))
 
-        yellow = (255, 200, 0)
-        away_won = game["away_score"] > game["home_score"]
-        home_won = game["home_score"] > game["away_score"]
+            away_logo = game.get("away_logo")
+            if away_logo is not None:
+                lx = (left_w - away_logo.width) // 2
+                ly = (half_h - away_logo.height) // 2
+                image.paste(away_logo, (lx, ly), away_logo)
+            home_logo = game.get("home_logo")
+            if home_logo is not None:
+                lx = (left_w - home_logo.width) // 2
+                ly = half_h + (half_h - home_logo.height) // 2
+                image.paste(home_logo, (lx, ly), home_logo)
 
-        away_txt_color = self._text_color_for(yellow) if away_won else self._text_color_for(game["away_color"])
-        home_txt_color = self._text_color_for(yellow) if home_won else self._text_color_for(game["home_color"])
+            # Thin winner accent -- a 2px border in the winning team's
+            # half, since there's no text bar left to highlight the way
+            # the other views do.
+            if away_won:
+                draw.rectangle([0, 0, left_w - 1, 1], fill=yellow)
+            elif home_won:
+                draw.rectangle([0, height - 2, left_w - 1, height - 1], fill=yellow)
+        else:
+            draw.rectangle([0, 0, col_w - 1, height - 1], fill=self._darken_color(game["away_color"]))
+            draw.rectangle([col_w, 0, left_w - 1, height - 1], fill=self._darken_color(game["home_color"]))
 
-        self._draw_team_column(image, draw, 0, 0, col_w, height,
-                                game["away_abbr"], game["away_score"], game.get("away_logo"),
-                                away_txt_color, game["away_color"], shared_font,
-                                bar_color_override=yellow if away_won else None)
-        self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
-                                game["home_abbr"], game["home_score"], game.get("home_logo"),
-                                home_txt_color, game["home_color"], shared_font,
-                                bar_color_override=yellow if home_won else None)
+            # Per explicit request: extra-innings view drops the score from
+            # the team column bar (the box score's R column already shows
+            # it) and centers just the abbreviation under the logo instead
+            # -- narrower text fits better at this view's tighter column
+            # width, and isn't redundant with R. Normal 9-inning view is
+            # untouched, still shows "ABBR SCORE" as before.
+            if is_extra_innings:
+                away_text = game["away_abbr"]
+                home_text = game["home_abbr"]
+            else:
+                away_text = f"{game['away_abbr']} {game['away_score']}"
+                home_text = f"{game['home_abbr']} {game['home_score']}"
+            available_text_width = col_w - 4
+            shared_font = self._fit_font_for_pair(draw, away_text, home_text, available_text_width, start_size=10)
 
-        draw.rectangle([left_w, 0, left_w, height - 1], fill=(166, 166, 166))
+            yellow = (255, 200, 0)
+            away_won = game["away_score"] > game["home_score"]
+            home_won = game["home_score"] > game["away_score"]
 
-        # Starts right after the separator (left_w+1), not left_w+2 --
-        # that extra pixel was never filled by anything (not the
-        # separator, not the green background), leaving a visible black
-        # seam on the left edge of the box score specifically. On the
-        # live/upcoming layouts that same gap is invisible since their
-        # black half has no distinct fill color to seam against.
-        right_x0 = left_w + 1
-        # Unlike the live/upcoming layouts, this extends all the way to
-        # the true panel edge (no "-1" reserve) -- that reserved pixel
-        # was left unfilled/black, which is exactly the "dark border"
-        # visible on the right edge of the box score.
+            away_txt_color = self._text_color_for(yellow) if away_won else self._text_color_for(game["away_color"])
+            home_txt_color = self._text_color_for(yellow) if home_won else self._text_color_for(game["home_color"])
+
+            self._draw_team_column(image, draw, 0, 0, col_w, height,
+                                    game["away_abbr"], game["away_score"], game.get("away_logo"),
+                                    away_txt_color, game["away_color"], shared_font,
+                                    bar_color_override=yellow if away_won else None,
+                                    show_score=not is_extra_innings)
+            self._draw_team_column(image, draw, col_w, 0, left_w - col_w, height,
+                                    game["home_abbr"], game["home_score"], game.get("home_logo"),
+                                    home_txt_color, game["home_color"], shared_font,
+                                    bar_color_override=yellow if home_won else None,
+                                    show_score=not is_extra_innings)
+
+        # No separate gray separator bar here anymore -- the box score's
+        # own grid-divider system already draws a line at its own left
+        # edge (grid_x0, matching right_x0 below), so a distinct gray
+        # bar immediately next to it was a redundant double-line, per
+        # explicit report. right_x0 starts exactly at left_w (no +1
+        # offset) so the box score's own border sits flush against the
+        # team columns with no unfilled pixel in between.
+        right_x0 = left_w
         right_w = width - right_x0
 
         FENWAY_GREEN = (13, 46, 33)
@@ -2415,9 +2555,8 @@ class TidbytBaseballPlugin(BasePlugin):
 
         draw.rectangle([right_x0, 0, right_x0 + right_w - 1, height - 1], fill=FENWAY_GREEN)
 
-        away_ls = game.get("away_linescores") or []
-        home_ls = game.get("home_linescores") or []
-        num_innings = max(9, len(away_ls), len(home_ls))
+        away_ls = away_ls_raw
+        home_ls = home_ls_raw
 
         # Investigate missing data: if the two teams' linescores arrays
         # are different lengths, log it so we can tell from real data
@@ -2440,39 +2579,52 @@ class TidbytBaseballPlugin(BasePlugin):
             )
 
         # Exact fixed widths based on measured ink + exactly 1px padding
-        # on each side, per explicit spec -- inning columns and E only
-        # ever need to fit a single digit (3px ink, confirmed uniform
-        # across all digits after the earlier "1" glyph widening), so
-        # 3 + 1 + 1 = 5px.
+        # on each side, per explicit spec -- inning columns 1-9 and E
+        # only ever need to fit a single digit (3px ink, confirmed
+        # uniform across all digits after the earlier "1" glyph
+        # widening), so 3 + 1 + 1 = 5px... plus 1 more, explained below.
+        # Inning columns 10-12 need the same treatment as R/H (7px ink,
+        # 2 digits) for their header labels, even though the run values
+        # within are almost always single-digit.
+        #
+        # +1 DIVIDER_W: confirmed via direct pixel inspection (and an
+        # explicit report) that each cell's own grid-divider line is
+        # drawn AT its left boundary (x0) -- see `for cx in col_bounds:
+        # draw.line(...)` below -- meaning that pixel was being silently
+        # counted as available drawing space for centering, swallowing
+        # what should have been a genuine empty 1px gap between the
+        # divider and the digit. The right edge doesn't have this
+        # problem (that divider belongs to the NEXT cell's own left
+        # edge). Widened every column by 1px specifically to give the
+        # divider its own pixel back, so "1px pad + ink + 1px pad" has
+        # the room it actually needs alongside it, not instead of it.
+        #
+        # NOTE: num_innings, and therefore right_w/left_w, were already
+        # derived from these exact same width constants further up --
+        # no capping needed here anymore, since the available space was
+        # built to exactly match what num_innings needs, not the other
+        # way around like before.
         single_digit_ink_w = 3
         double_digit_ink_w = 7
         pad = 1
-        inning_col_w = single_digit_ink_w + pad * 2   # 5
-        e_col_w = single_digit_ink_w + pad * 2         # 5, same as innings
-        min_wide_col_w = double_digit_ink_w + pad * 2  # 9, minimum for R/H
+        DIVIDER_W = 1
+        inning_col_w = single_digit_ink_w + pad * 2 + DIVIDER_W   # 6, innings 1-9
+        inning_col_w_wide = double_digit_ink_w + pad * 2 + DIVIDER_W  # 10, innings 10-12
+        e_col_w = single_digit_ink_w + pad * 2 + DIVIDER_W         # 6, same as innings 1-9
+        min_wide_col_w = double_digit_ink_w + pad * 2 + DIVIDER_W  # 10, minimum for R/H
 
-        # Cap displayed innings using the MINIMUM wide-column width as a
-        # conservative assumption -- ensures R/H never shrink below their
-        # functional minimum even in a long extra-innings game, before
-        # we know the final num_innings needed to compute their actual
-        # (possibly larger) width below.
-        fixed_extra_w_min = min_wide_col_w * 2 + e_col_w
-        max_innings_that_fit = max((right_w - fixed_extra_w_min) // inning_col_w, 1)
-        num_innings = min(num_innings, max_innings_that_fit, 12)
+        # R/H fixed at exactly 1px padding around a potential
+        # double-digit value -- never wider, never narrower. Any
+        # leftover space beyond what's actually needed was already
+        # eliminated by deriving left_w/right_w from num_innings above,
+        # so there shouldn't be meaningful leftover here anymore either
+        # way.
+        num_narrow_innings = min(num_innings, 9)
+        num_wide_innings = max(num_innings - 9, 0)
+        wide_col_w = min_wide_col_w
 
-        # IMPORTANT: confirmed via a direct look at the raw rendered image
-        # (bypassing any web UI rendering entirely) that fixing R/H at
-        # exactly 9px left real, visible unused space after the E column
-        # whenever the fixed columns didn't fully consume the available
-        # width -- correct geometry, but wasted space that looked wrong.
-        # R/H now dynamically absorb ALL leftover width instead of
-        # leaving it unused, per explicit spec allowance that they can
-        # be "slightly wider" -- never shrinking below the minimum
-        # needed to comfortably fit double digits.
-        remaining_for_wide = right_w - (inning_col_w * num_innings) - e_col_w
-        wide_col_w = max(remaining_for_wide // 2, min_wide_col_w)
-
-        col_widths = [inning_col_w] * num_innings + [wide_col_w, wide_col_w, e_col_w]
+        inning_col_widths = [inning_col_w] * num_narrow_innings + [inning_col_w_wide] * num_wide_innings
+        col_widths = inning_col_widths + [wide_col_w, wide_col_w, e_col_w]
         total_grid_w = sum(col_widths)
         # REVERTED centering: confirmed via direct debug logging that the
         # column-width/padding math itself is correct (col_bounds matches
@@ -2520,7 +2672,22 @@ class TidbytBaseballPlugin(BasePlugin):
 
         def draw_cell(x0, x1, y0, y1, text, color=TEXT_COLOR):
             if text:
-                w, h = x1 - x0, y1 - y0
+                # IMPORTANT: x0 has a grid-divider line drawn directly on
+                # it (see the `for cx in col_bounds: draw.line(...)`
+                # above) -- that divider consumes 1px of THIS cell's own
+                # nominal [x0,x1) range. The right edge (x1) does NOT
+                # have this problem: that divider belongs to the NEXT
+                # cell's own left edge, not this one, so it doesn't eat
+                # into this cell's space. Confirmed via direct pixel
+                # inspection (and an explicit report) that centering
+                # against the full x1-x0 width was treating the divider
+                # pixel as available drawing space, silently swallowing
+                # the intended 1px left padding -- what looked like "1px
+                # padding" was actually just the divider itself, with
+                # zero true empty gap behind it.
+                true_x0 = x0 + 1
+                w = x1 - true_x0
+                h = y1 - y0
                 bbox = self._measure(font, text)
                 th = bbox[3] - bbox[1]
                 # IMPORTANT: centering horizontally using _measure's width
@@ -2536,7 +2703,7 @@ class TidbytBaseballPlugin(BasePlugin):
                 # _ink_extent measures real rendered ink instead.
                 ink_left, ink_right = self._ink_extent(font, text)
                 ink_w = ink_right - ink_left + 1
-                target_ink_x0 = x0 + max((w - ink_w) // 2, 0)
+                target_ink_x0 = true_x0 + max((w - ink_w) // 2, 0)
                 tx = target_ink_x0 - ink_left + 3  # +3 undoes _ink_extent's internal scratch-render offset
                 # Vertical centering: rounds UP (biases the text down)
                 # rather than floor-rounding, specifically to fix row 2
@@ -2797,7 +2964,6 @@ class TidbytBaseballPlugin(BasePlugin):
         text_line = f"{abbr} {score}" if show_score else abbr
         line_bbox = self._measure(font, text_line)
         line_h = line_bbox[3] - line_bbox[1]
-        line_w = line_bbox[2] - line_bbox[0]
         bar_h = line_h + 4
 
         if logo is not None:
@@ -2813,8 +2979,16 @@ class TidbytBaseballPlugin(BasePlugin):
         bar_color = bar_color_override if bar_color_override is not None else bg_color
         draw.rectangle([x0, bar_y0, x0 + w - 1, y0 + h - 1], fill=bar_color)
 
-        tx = x0 + max((w - line_w) // 2, 0)
-        tx = min(tx, x0 + w - line_w) if line_w < w else x0
+        # Ink-based centering (not _measure's width, which includes
+        # trailing advance space and drifts the result) -- confirmed
+        # real via a reported case where the abbreviation-only text
+        # wasn't centered under the logo. Logo is centered against the
+        # same column width w, so aligning ink to that same center
+        # keeps both genuinely aligned.
+        ink_left, ink_right = self._ink_extent(font, text_line)
+        ink_w = ink_right - ink_left + 1
+        target_ink_x0 = x0 + max((w - ink_w) // 2, 0)
+        tx = target_ink_x0 - ink_left + 3  # +3 undoes _ink_extent's internal scratch-render offset
         ty = bar_y0 + max((bar_h - line_h) // 2, 0) - line_bbox[1]
         self._render_text(image, (tx, ty), text_line, font, text_color)
 

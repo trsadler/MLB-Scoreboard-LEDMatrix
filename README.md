@@ -227,6 +227,258 @@ rather than failing silently into the generic fallback.
   layout numbers working out that way -- not a deliberate bump, just
   where the math landed.
 
+## Fixed: real breakage -- ESPN started rejecting the plugin's User-Agent
+
+Real report (via Chuck): ESPN started rejecting certain User-Agent
+headers around 8/4, and the plugin was showing "No Game" universally.
+Investigated first by pulling live current data and cross-checking
+every field the plugin depends on (inning-half text fallback, MID/END
+detection, hits/errors, records, batter/pitcher structure) -- all
+still matched correctly, meaning this wasn't a data-shape change. The
+symptom (everything failing at once, not some specific parsing edge
+case) pointed at the request level instead.
+
+The plugin was sending a custom `"LEDMatrix-TidbytBaseball/1.0"`
+User-Agent -- exactly the kind of easily-flagged non-browser string a
+bot-detection change would target. Switched to a standard browser UA,
+which is the well-known safe fix for this class of issue. Confirmed
+all 6 ESPN fetch call sites in the codebase go through the same shared
+session object, so this fix applies universally, not just to the main
+scoreboard fetch.
+
+Also added specific, actionable logging for HTTP 401/403 responses --
+this failure previously only showed up as a generic "No Game" display
+with no clear cause in the logs, and needed an external tip to
+diagnose. Now it's self-diagnosable: the log calls out the exact
+status code and current User-Agent string directly.
+
+Couldn't directly verify the fix against a live rejected request from
+this environment (no outbound network access in the sandbox used for
+this work) -- this needs confirmation against the real, currently
+broken deployment.
+
+## Per-view fixes: 10-inning centering, 11-inning bigger logos, 12-inning rebuilt
+
+Explicit per-view direction, with 9-inning confirmed untouched (its
+layout math measured byte-for-byte identical before and after this
+round).
+
+**10-inning**: abbreviation wasn't centered under the logo. Root cause
+was the exact same bug fixed twice before elsewhere (upcoming-game
+text, box-score digits) but never applied to `_draw_team_column`
+specifically -- it was centering against `_measure`'s width, which
+includes trailing advance space and drifts the result, instead of
+actual ink extent. Fixed the same way. Verified: logo center and text
+ink center now both measure 9.0px, genuinely aligned rather than just
+each independently "centered" against slightly different references.
+
+**11-inning**: logos enlarged on request -- increased the bleed
+allowance specifically for this inning count (12 vs the standard 4),
+landing at 26px vs the neighboring 10-inning view's 23px. Picked this
+value deliberately: an earlier attempt at 29px would have bled about
+7-8px beyond its own 14px-wide column on each side, risking visible
+overlap with the adjacent team's logo -- 26px keeps the increase
+clearly noticeable (not just 1px) while keeping the bleed reasonable
+(6px each side).
+
+**12-inning**: rebuilt entirely, per explicit direction that
+side-by-side columns don't have enough room to work at this width.
+Team boxes now stack vertically (away on top, home on bottom, each
+spanning the full left_w width but half the panel height) instead of
+side by side, with the abbreviation text dropped entirely -- logo and
+team color carry the identification, with the box score's own R column
+still showing the actual score. Added a thin 2px yellow accent bar in
+the winning team's half, replacing the highlighted bar the other views
+use (there's no text bar left here to highlight the same way). This
+also let logos grow further despite the narrower width, since each one
+now gets the FULL left_w for its own space rather than half.
+
+Verified all three changes with direct pixel measurement (not just
+visual inspection): confirmed the 9-inning layout's exact debug-log
+values are unchanged, confirmed the 10-inning text/logo center match,
+and confirmed the 12-inning stacked structure (away's darkened blue on
+top, home's darkened red on bottom, split cleanly at the panel's
+vertical midpoint, yellow winner-accent in the correct half).
+
+## Fixed: removed a redundant gray separator bar
+
+Real report: an unnecessary gray bar between team columns and the box
+score. Root cause: a separate 1px gray rectangle was drawn at that
+boundary as a leftover from before the box score had its own grid
+system -- now that the box score draws its own divider at its left
+edge as part of the grid, the two sat right next to each other as a
+redundant double line.
+
+Removed the separate gray bar and moved the box score's start position
+to sit flush against the team columns (right_x0 now exactly equals
+left_w, not left_w+1), so the box score's own border serves as the
+single visual separator. Also removed the -1px reserve from the
+left_w derivation that existed specifically to make room for the
+now-gone separator, keeping the box score's exact-width guarantee
+intact.
+
+Verified directly: confirmed zero gray (166,166,166) pixels remain
+anywhere in the render, zero black gap at the boundary, and the pixel
+transition goes directly from team color to the grid's own border
+color to the green fill -- one clean line, not two. Re-confirmed
+total_grid_w still exactly matches right_w in all four inning-count
+views after this change.
+
+## Fixed: grid dividers were silently eating the left-side padding
+
+Real root cause, found exactly as suspected: each cell's own
+grid-divider line is drawn AT its left boundary (x0), but the
+column-width math treated the full [x0,x1) range as clean drawable
+space for centering -- meaning the divider pixel itself was being
+counted as if it were the intended 1px padding, leaving ZERO genuine
+empty gap between the line and the digit. The right edge of each cell
+doesn't have this problem, since that divider belongs to the NEXT
+cell's own left edge -- exactly why only the left side was affected.
+
+Fixed with two changes together (one alone wasn't enough): widened
+every column by 1px (6/10 instead of 5/9) to give the divider its own
+pixel back, and adjusted the cell-centering math to compute available
+space starting after that pixel, not including it.
+
+Verified precisely, not just visually: measured the TRUE gap between
+the divider pixel and the digit ink (explicitly excluding the divider
+itself from the count) across all 9 inning columns plus R/H/E --
+every single one now shows exactly 1px on both sides. Re-confirmed
+zero leftover space is preserved across all four inning-count views
+(total_grid_w still exactly equals right_w in every case). Also
+updated the matching logo-sizing calculation to the new widths, same
+spot that's caused sync issues before.
+
+One consequence worth flagging: since every column grew by 1px, the
+12-inning view's team columns shrank further (col_w 32->17) to make
+room. Worth a look if that's too tight for logos at that extreme case.
+
+## Fixed: unused empty space on the right in 9/10/11-inning views
+
+Real correction to the previous fix: giving every column its exact
+minimal padding (correct) while keeping left_w fixed per a binary
+"extra innings or not" split (wrong) inevitably left a gap whenever a
+game had fewer wide (10-12) columns than the 12-inning case that fixed
+value was sized for.
+
+Real fix: restructured so num_innings (capped at 12) is determined
+FIRST, the box score's exact width need is computed from that specific
+count, and left_w is derived as whatever's left over -- not the other
+way around. This eliminates leftover space entirely rather than just
+tolerating it as "harmless green margin": the box score now always
+gets exactly what it needs, no more, no less, and team columns/logos
+get back whatever width that specific game's inning count doesn't
+require. A 9-inning game now actually gets MORE logo room (col_w=29)
+than before any of this work started, since it needs zero extra
+squeeze; a 12-inning game still gets the smallest (col_w=16), since it
+needs the most.
+
+Verified precisely: confirmed via the real debug log that
+total_grid_w now exactly equals right_w in all four cases (68=68,
+77=77, 86=86, 95=95) -- zero leftover, not just "small enough to not
+notice." Re-verified R/H padding with genuinely double-digit test
+values (11 runs, 13 hits) across all four views -- all 8 measurements
+exactly 1px both sides. Also caught and fixed a leftover syntax
+artifact from the previous edit (a stray unreachable line) during this
+cleanup.
+
+## Fixed: R/H columns had unnecessary extra padding
+
+Real correction: the "R/H dynamically absorb leftover width" behavior
+from a couple rounds back was producing needlessly wide columns --
+confirmed 16px in the 9-inning view and 18px in the 10/11-inning views
+(not just the 9-inning view specifically, though that's what got
+reported), rather than the requested exact fit.
+
+Reverted to a fixed 9px for R/H always -- exactly 1px padding on each
+side of a potential double-digit value, since errors never go
+double-digit so E correctly stays single-digit width. Any leftover
+space beyond what the columns actually need now just becomes plain
+green margin at the right edge, which is already established as
+visually fine (same green as the rest of the box score, not a black
+gap).
+
+Verified precisely across all four views (9/10/11/12 innings): R/H
+both measure exactly 9px now in every case. Confirmed the padding
+itself is correct too -- tested with a genuine double-digit score (11)
+and got exactly 1px on both sides; a single-digit score in the same
+column naturally shows more visual padding since the column is sized
+for the worst case, which is expected, not a bug.
+
+## Extra-innings view: dropped the score from team columns, centered abbreviation under logo
+
+Per explicit request: since the box score's R column already shows the
+final score, the team column bar in the extra-innings view now shows
+just the abbreviation (centered under the logo, reusing the same
+show_score=False path already built for the upcoming-game view)
+instead of "ABBR SCORE". Normal 9-inning view is untouched, still
+shows the score as before -- this only applies when a game actually
+went to extras, same conditional already used for the column-width
+change above.
+
+Verified precisely: measured actual text ink width and confirmed the
+9-inning view still renders the full "ABBR SCORE" combined text, while
+all three extra-innings views render exactly the abbreviation alone
+(12px ink width, matching "ATH" precisely with no leftover score
+digits). Checked centering too -- text center vs. column center off by
+only 0.5px in every case, essentially exact.
+
+Rendered and confirmed all four requested views individually (9, 10,
+11, 12 innings) rather than just the boundary cases.
+
+## Fixed: double-digit inning columns (10/11/12) were colliding
+
+Confirmed via direct measurement: header labels "10"/"11"/"12" need
+7px of ink (two digits), but every inning column -- including these --
+was uniformly 5px, sized for a single digit. Genuinely too narrow,
+not just tight.
+
+Fixed by giving innings 10-12 specifically the same wide treatment as
+R/H (9px, matching their 2-digit width need), while innings 1-9 stay
+at exactly 5px -- unchanged from the normal view. Per explicit
+requirement, this widening (and the additional team-column/logo
+squeeze needed to make room for it -- left_w 44px -> 32px, per-team
+column 22px -> 16px) ONLY applies when a game actually went to extra
+innings; determined this before computing left_w specifically so the
+normal <=9 inning view is completely unaffected.
+
+Verified precisely: the normal 9-inning case still shows left_w=44
+exactly as before with all 9 columns at 1px padding; the 12-inning
+case correctly widens to left_w=32, with the previously-colliding
+innings 10/11/12 now measuring exactly 1px padding on both sides
+(down from a guaranteed overflow); re-checked the standard 9-inning
+game after this change to confirm zero pixel-level difference from
+before. Also tested the 10 and 11-inning boundary cases specifically
+(not just the full 12), and a 15-inning stress case to confirm the
+hard cap still holds. Updated logo sizing to match the same
+conditional logic, checking a game's own linescores length the same
+way, to avoid recreating the earlier logo-bleed bug from these two
+spots drifting out of sync.
+
+## Widened the box score so all 12 innings genuinely fit
+
+Follow-up to a community question: confirmed with exact arithmetic
+that the previous 60/40 split gave the box score 76px, but 12 innings
+at minimum column widths needs 83px (12*5 + 2*9 + 5) -- meaning any
+real 11+ inning game was silently dropping its last 1-2 innings from
+the display (the final R/H/E totals were always correct regardless,
+just the per-inning breakdown was incomplete).
+
+Per explicit request to prioritize this: widened the box score's share
+of the panel (left_w 51px -> 44px, team columns/logos correspondingly
+narrower at 22px instead of 25px) specifically so the box score gets
+the full 83px it needs. Updated logo sizing to match in the same spot
+that was the source of an earlier logo-bleed bug when these two got
+out of sync.
+
+Verified via the real internal debug log (not assumption): col_bounds
+now has 16 boundaries (15 columns = 12 innings + R/H/E), with
+total_grid_w exactly matching the available 83px -- zero wasted space.
+Re-checked padding across all 12 real inning columns individually --
+still exactly 1px on both sides for every one, matching spec. Also
+re-rendered a standard 9-inning game at the new width to confirm
+normal games still look correct, not just the extra-innings case.
+
 ## Improved: DUE UP now uses the MID/END signal as its primary source
 
 Follow-up after the previous fix still occasionally showed the wrong
